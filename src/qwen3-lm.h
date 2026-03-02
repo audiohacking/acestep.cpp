@@ -275,7 +275,8 @@ static struct ggml_tensor * qw3lm_build_attn(
         int kv_pos,
         int kv_len,
         int n_tokens,
-        bool use_flash_attn = true) {
+        bool use_flash_attn = true,
+        bool clamp_fp16 = false) {
 
     int D   = c.head_dim;
     int Nh  = c.n_heads;
@@ -327,6 +328,12 @@ static struct ggml_tensor * qw3lm_build_attn(
     // Make contiguous for cpy to f16 cache
     k = ggml_cont(ctx, k);
     v = ggml_cont(ctx, v);
+
+    // Clamp V before F16 cast: sub-Ampere tensor cores accumulate in FP16,
+    // V projection can overflow to inf which corrupts all subsequent attention
+    if (clamp_fp16) {
+        v = ggml_clamp(ctx, v, -65504.0f, 65504.0f);
+    }
 
     // Write K,V to cache at kv_pos
     // Cache layout: [D, max_seq, Nkv] f16
@@ -410,10 +417,13 @@ static void qw3lm_forward(Qwen3LM * m, const int * token_ids, int n_tokens,
         struct ggml_tensor * attn = qw3lm_build_attn(
             ctx, gf, c, ly, norm, positions, mask,
             m->kv_k[kv_set][l], m->kv_v[kv_set][l],
-            kv_pos, kv_len, n_tokens, m->use_flash_attn);
+            kv_pos, kv_len, n_tokens, m->use_flash_attn, m->clamp_fp16);
 
         // Residual
         hidden = ggml_add(ctx, hidden, attn);
+        if (m->clamp_fp16) {
+            hidden = ggml_clamp(ctx, hidden, -65504.0f, 65504.0f);
+        }
 
         // Post-attention norm + MLP
         norm = qwen3_rms_norm(ctx, hidden, ly->post_attn_layernorm, c.rms_norm_eps);
@@ -577,6 +587,11 @@ static void qw3lm_forward_batch(Qwen3LM * m, const int * token_ids,
         k = ggml_cont(ctx, k);
         v = ggml_cont(ctx, v);
 
+        // Clamp V before F16 cast (sub-Ampere FP16 accumulation overflow)
+        if (m->clamp_fp16) {
+            v = ggml_clamp(ctx, v, -65504.0f, 65504.0f);
+        }
+
         // Batched attention with 4D KV cache
         float scale = 1.0f / sqrtf((float)D);
 
@@ -633,6 +648,9 @@ static void qw3lm_forward_batch(Qwen3LM * m, const int * token_ids,
         // Batched O proj
         struct ggml_tensor * attn_out = qwen3_linear(ctx, ly->o_proj, attn_cat);
         hidden = ggml_add(ctx, hidden, attn_out);
+        if (m->clamp_fp16) {
+            hidden = ggml_clamp(ctx, hidden, -65504.0f, 65504.0f);
+        }
 
         // Batched FFN
         norm = qwen3_rms_norm(ctx, hidden, ly->post_attn_layernorm, c.rms_norm_eps);
@@ -706,8 +724,7 @@ static void qw3lm_free(Qwen3LM * m) {
     if (m->sched) ggml_backend_sched_free(m->sched);
     if (m->kv_buf) ggml_backend_buffer_free(m->kv_buf);
     if (m->kv_ctx) ggml_free(m->kv_ctx);
-    if (m->backend && m->backend != m->cpu_backend) ggml_backend_free(m->backend);
-    if (m->cpu_backend) ggml_backend_free(m->cpu_backend);
+    backend_release(m->backend, m->cpu_backend);
     wctx_free(&m->wctx);
     *m = {};
 }
