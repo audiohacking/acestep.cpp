@@ -31,12 +31,7 @@ set -eu
 SRC_AUDIO="my_reference.mp3"   # path to your source WAV or MP3 file
 # ─────────────────────────────────────────────────────────────────────
 
-# Step 1: generate lyrics + audio codes with the LLM
-../build/ace-qwen3 \
-    --request cover.json \
-    --model ../models/acestep-5Hz-lm-4B-Q8_0.gguf
-
-# Step 2: run the DiT+VAE pipeline with the reference audio
+# Step 1: run the DiT+VAE pipeline with the reference audio (no LLM needed)
 #
 #   --src-audio accepts WAV or MP3; any sample rate is accepted and
 #   automatically converted to 48 kHz stereo before encoding.
