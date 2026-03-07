@@ -1,1 +1,0 @@
-/usr/bin/c++ -O3 -DNDEBUG -Wl,--dependency-file=CMakeFiles/neural-codec.dir/link.d "CMakeFiles/neural-codec.dir/tools/neural-codec.cpp.o" -o neural-codec  -Wl,-rpath,/home/runner/work/acestep.cpp/acestep.cpp/build-ci/ggml/src ggml/src/libggml.so.0.9.7 ggml/src/libggml-cpu.so.0.9.7 ggml/src/libggml-base.so.0.9.7

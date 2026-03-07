@@ -1,1 +1,0 @@
-/usr/bin/c++ -O3 -DNDEBUG -Wl,--dependency-file=CMakeFiles/quantize.dir/link.d CMakeFiles/quantize.dir/tools/quantize.cpp.o -o quantize  -Wl,-rpath,/home/runner/work/acestep.cpp/acestep.cpp/build-ci/ggml/src ggml/src/libggml.so.0.9.7 ggml/src/libggml-cpu.so.0.9.7 ggml/src/libggml-base.so.0.9.7

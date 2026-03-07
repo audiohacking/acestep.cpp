@@ -1,1 +1,0 @@
-/usr/bin/c++ -fPIC -O3 -DNDEBUG -Wl,--dependency-file=CMakeFiles/ggml.dir/link.d -shared -Wl,-soname,libggml.so.0 -o libggml.so.0.9.7 "CMakeFiles/ggml.dir/ggml-backend-dl.cpp.o" "CMakeFiles/ggml.dir/ggml-backend-reg.cpp.o"  -Wl,-rpath,/home/runner/work/acestep.cpp/acestep.cpp/build-ci/ggml/src: -ldl libggml-cpu.so.0.9.7 libggml-base.so.0.9.7
