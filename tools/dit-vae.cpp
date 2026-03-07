@@ -6,13 +6,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <cmath>
 #include <vector>
 #include <random>
 #include "philox.h"
 
-#include "ggml.h"
-#include "ggml-backend.h"
 #include "dit-sampler.h"
 #include "vae.h"
 #include "qwen3-enc.h"
@@ -22,7 +19,6 @@
 #include "debug.h"
 #include "request.h"
 #include "timer.h"
-#include "audio.h"
 
 // Minimal WAV writer (16-bit PCM stereo)
 static bool write_wav(const char * path, const float * audio, int T_audio, int sr) {
@@ -67,9 +63,6 @@ static void print_usage(const char * prog) {
         "  --text-encoder <gguf>   Text encoder GGUF file\n"
         "  --dit <gguf>            DiT GGUF file\n"
         "  --vae <gguf>            VAE GGUF file\n\n"
-        "LoRA:\n"
-        "  --lora <path>           LoRA adapter (adapter_model.safetensors)\n"
-        "  --lora-scale <float>    LoRA scale, e.g. alpha/rank (default: 1.0)\n\n"
         "Batch:\n"
         "  --batch <N>             DiT variations per request (default: 1, max 9)\n\n"
         "Output naming: input.json -> input0.wav, input1.wav, ... (last digit = batch index)\n\n"
@@ -103,12 +96,10 @@ int main(int argc, char ** argv) {
     const char * dit_gguf      = NULL;
     const char * vae_gguf      = NULL;
     const char * dump_dir      = NULL;
-    const char * lora_path     = NULL;
-    float lora_scale            = 1.0f;
     bool use_fa                = true;
-    int batch_n                 = 1;
-    int vae_chunk               = 256;
-    int vae_overlap             = 64;
+    int batch_n                = 1;
+    int vae_chunk              = 256;
+    int vae_overlap            = 64;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--request") == 0) {
@@ -124,8 +115,6 @@ int main(int argc, char ** argv) {
         else if (strcmp(argv[i], "--batch") == 0 && i+1 < argc) batch_n = atoi(argv[++i]);
         else if (strcmp(argv[i], "--vae-chunk") == 0 && i+1 < argc) vae_chunk = atoi(argv[++i]);
         else if (strcmp(argv[i], "--vae-overlap") == 0 && i+1 < argc) vae_overlap = atoi(argv[++i]);
-        else if (strcmp(argv[i], "--lora") == 0 && i+1 < argc) lora_path = argv[++i];
-        else if (strcmp(argv[i], "--lora-scale") == 0 && i+1 < argc) lora_scale = (float)atof(argv[++i]);
         else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             print_usage(argv[0]); return 0;
         } else {
@@ -171,16 +160,6 @@ int main(int argc, char ** argv) {
         return 1;
     }
     fprintf(stderr, "[Load] DiT weight load: %.1f ms\n", timer.ms());
-
-    if (lora_path) {
-        timer.reset();
-        if (!dit_ggml_load_lora(&model, lora_path, lora_scale)) {
-            fprintf(stderr, "FATAL: failed to load LoRA from %s\n", lora_path);
-            dit_ggml_free(&model);
-            return 1;
-        }
-        fprintf(stderr, "[Load] LoRA: %.1f ms\n", timer.ms());
-    }
 
     // Read DiT GGUF metadata + silence_latent tensor (once)
     bool is_turbo = false;
@@ -247,11 +226,8 @@ int main(int argc, char ** argv) {
             continue;
         }
 
-        // Extract params (append custom_tag to caption for LoRA/condition so trigger is in text)
-        std::string caption_for_cond = req.caption;
-        if (!req.custom_tag.empty())
-            caption_for_cond += ", " + req.custom_tag;
-        const char * caption  = caption_for_cond.c_str();
+        // Extract params
+        const char * caption  = req.caption.c_str();
         const char * lyrics   = req.lyrics.c_str();
         char bpm_str[16] = "N/A";
         if (req.bpm > 0) snprintf(bpm_str, sizeof(bpm_str), "%d", req.bpm);
@@ -262,12 +238,12 @@ int main(int argc, char ** argv) {
         float duration        = req.duration > 0 ? req.duration : 30.0f;
         long long seed        = req.seed;
         int num_steps         = req.inference_steps > 0 ? req.inference_steps : 8;
-        float guidance_scale  = req.guidance_scale > 0 ? req.guidance_scale : 7.0f;
+        float guidance_scale  = req.guidance_scale;
         float shift           = req.shift > 0 ? req.shift : 1.0f;
-        float cover_strength  = req.audio_cover_strength >= 0 && req.audio_cover_strength <= 1
-            ? req.audio_cover_strength : 1.0f;
 
-        if (is_turbo && guidance_scale > 1.0f) {
+        if (guidance_scale <= 0.0f)
+            guidance_scale = is_turbo ? 1.0f : 7.0f;
+        else if (is_turbo && guidance_scale > 1.0f) {
             fprintf(stderr, "[Pipeline] WARNING: turbo model, forcing guidance_scale=1.0 (was %.1f)\n",
                     guidance_scale);
             guidance_scale = 1.0f;
@@ -281,39 +257,8 @@ int main(int argc, char ** argv) {
         fprintf(stderr, "[Pipeline] seed=%lld, steps=%d, guidance=%.1f, shift=%.1f, duration=%.1fs\n",
                 seed, num_steps, guidance_scale, shift, duration);
 
-        // Parse audio codes from request (or produce from src_audio WAV/MP3)
+        // Parse audio codes from request
         std::vector<int> codes_vec = parse_codes_string(req.audio_codes);
-        if (codes_vec.empty() && !req.src_audio.empty() && have_vae) {
-            const std::string & src_path = req.src_audio;
-            std::vector<float> wav_stereo;
-            int n_samples = load_audio_48k_stereo(src_path.c_str(), &wav_stereo);
-            if (n_samples > 0) {
-                int T_audio = n_samples;
-                if (T_audio >= 1920) {
-                    VAEEncoderGGML enc = {};
-                    if (vae_encoder_load(&enc, vae_gguf)) {
-                        size_t max_lat = (size_t)(T_audio / 2048) + 1;
-                        std::vector<float> enc_out(max_lat * 64);
-                        int T_lat = vae_encoder_forward(&enc, wav_stereo.data(), T_audio, enc_out.data());
-                        vae_encoder_free(&enc);
-                        if (T_lat >= FSQ_FRAMES_PER_CODE) {
-                            DetokGGML detok = {};
-                            if (detok_ggml_load(&detok, dit_gguf, model.backend, model.cpu_backend)) {
-                                std::vector<float> codeword_table((size_t)FSQ_N_CODES * FSQ_FRAMES_PER_CODE * 64);
-                                fprintf(stderr, "[Cover] building FSQ codeword table (8000 codes)...\n");
-                                detok_ggml_build_codeword_table(&detok, codeword_table.data());
-                                latent_frames_to_codes(T_lat, enc_out.data(), codeword_table.data(), &codes_vec);
-                                fprintf(stderr, "[Cover] encoded %s -> %zu codes (%.1fs @ 5Hz)\n",
-                                        src_path.c_str(), codes_vec.size(), (float)codes_vec.size() / 5.0f);
-                                detok_ggml_free(&detok);
-                            }
-                        }
-                    }
-                }
-            } else {
-                fprintf(stderr, "[Cover] WARNING: cannot load src_audio %s (use .wav or .mp3), skipping cover-from-file\n", src_path.c_str());
-            }
-        }
         if (!codes_vec.empty())
             fprintf(stderr, "[Pipeline] %zu audio codes (%.1fs @ 5Hz)\n",
                     codes_vec.size(), (float)codes_vec.size() / 5.0f);
@@ -416,50 +361,16 @@ int main(int argc, char ** argv) {
         }
         fprintf(stderr, "[Load] ConditionEncoder: %.1f ms\n", timer.ms());
 
-        // Timbre input: reference_audio (WAV or MP3 via VAE encoder) or silence (first 750 frames = 30s @ 25Hz)
+        // Silence feats for timbre input: first 750 frames (30s @ 25Hz)
         const int S_ref = 750;
-        std::vector<float> timbre_feats(S_ref * 64);
-        const float * timbre_ptr = silence_full.data();
-        int S_ref_actual = S_ref;
-        if (!req.reference_audio.empty()) {
-            const std::string & ref_path = req.reference_audio;
-            std::vector<float> wav_stereo;
-            int n_samples = load_audio_48k_stereo(ref_path.c_str(), &wav_stereo);
-            if (n_samples > 0 && have_vae) {
-                VAEEncoderGGML enc = {};
-                if (vae_encoder_load(&enc, vae_gguf)) {
-                    int T_audio = n_samples;
-                    if (T_audio >= 1920) {
-                        // Encoder strides 2,4,4,8,8 -> max latent frames = T_audio/2048 + 1
-                        size_t max_lat = (size_t)(T_audio / 2048) + 1;
-                        std::vector<float> enc_out(max_lat * 64);
-                        int T_lat = vae_encoder_forward(&enc, wav_stereo.data(), T_audio, enc_out.data());
-                        if (T_lat > 0) {
-                            size_t copy_frames = (size_t)(T_lat < S_ref ? T_lat : S_ref);
-                            memcpy(timbre_feats.data(), enc_out.data(), copy_frames * 64 * sizeof(float));
-                            if (T_lat < S_ref)
-                                memcpy(timbre_feats.data() + copy_frames * 64, silence_full.data(),
-                                       (S_ref - (int)copy_frames) * 64 * sizeof(float));
-                            S_ref_actual = (int)copy_frames;
-                            if (T_lat > S_ref) S_ref_actual = S_ref;
-                            timbre_ptr = timbre_feats.data();
-                            fprintf(stderr, "[Timbre] encoded %s -> %d frames (25Hz)\n", ref_path.c_str(), S_ref_actual);
-                        }
-                    }
-                    vae_encoder_free(&enc);
-                }
-            } else if (n_samples <= 0) {
-                fprintf(stderr, "[Timbre] WARNING: cannot load audio %s (use .wav or .mp3), using silence\n", ref_path.c_str());
-            } else if (!have_vae) {
-                fprintf(stderr, "[Timbre] reference_audio requires --vae (with encoder weights); using silence\n");
-            }
-        }
+        std::vector<float> silence_feats(S_ref * 64);
+        memcpy(silence_feats.data(), silence_full.data(), S_ref * 64 * sizeof(float));
 
         timer.reset();
         std::vector<float> enc_hidden;
         cond_ggml_forward(&cond, text_hidden.data(), S_text,
                            lyric_embed.data(), S_lyric,
-                           timbre_ptr, S_ref_actual,
+                           silence_feats.data(), S_ref,
                            enc_hidden, &enc_S);
         fprintf(stderr, "[Encode] ConditionEncoder: %.1f ms, enc_S=%d\n", timer.ms(), enc_S);
 
@@ -503,20 +414,15 @@ int main(int argc, char ** argv) {
         }
 
         // Build single context: [T, ctx_ch] = src_latents[64] + mask_ones[64]
-        // src_latents = blend(decoded_codes, silence) for t<decoded_T, else silence; audio_cover_strength controls blend
+        // src_latents = decoded_codes[0:decoded_T] + silence_latent[0:T-decoded_T]
+        // Padding reads silence from frame 0 (not from decoded_T), matching reference implementation
         std::vector<float> context_single(T * ctx_ch);
         for (int t = 0; t < T; t++) {
-            for (int c = 0; c < Oc; c++) {
-                float v;
-                if (t < decoded_T) {
-                    float dec = decoded_latents[t * Oc + c];
-                    float sil = silence_full[c];  // frame 0 of silence
-                    v = (1.0f - cover_strength) * sil + cover_strength * dec;
-                } else {
-                    v = silence_full[(t - decoded_T) * Oc + c];
-                }
-                context_single[t * ctx_ch + c] = v;
-            }
+            const float * src = (t < decoded_T)
+                ? decoded_latents.data() + t * Oc
+                : silence_full.data() + (t - decoded_T) * Oc;
+            for (int c = 0; c < Oc; c++)
+                context_single[t * ctx_ch + c] = src[c];
             for (int c = 0; c < Oc; c++)
                 context_single[t * ctx_ch + Oc + c] = 1.0f;
         }

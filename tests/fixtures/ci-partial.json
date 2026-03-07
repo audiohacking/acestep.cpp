@@ -1,8 +1,0 @@
-{
-  "caption": "Short CI hip hop clip",
-  "lyrics": "[Intro]\nYeah\n\n[Verse 1]\nOne two\n\n[Chorus]\nTest\n\n[Outro]\nDone",
-  "duration": 5,
-  "vocal_language": "fr",
-  "inference_steps": 4,
-  "shift": 3
-}

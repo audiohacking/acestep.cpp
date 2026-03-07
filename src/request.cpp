@@ -6,20 +6,16 @@
 
 #include "request.h"
 #include <cstdlib>
-#include <cstring>
 #include <string>
 #include <vector>
 
-// Defaults (aligned with Python GenerationParams and ACE-Step 1.5 Tutorial)
+// Defaults (aligned with Python GenerationParams)
 void request_init(AceRequest * r) {
-    r->task_type          = "text2music";
     r->caption            = "";
     r->lyrics             = "";
-    r->instrumental       = false;
-    r->custom_tag         = "";
-    r->genre              = "";
+
     r->bpm                = 0;
-    r->duration           = -1.0f;
+    r->duration           = 0.0f;
     r->keyscale           = "";
     r->timesignature      = "";
     r->vocal_language     = "unknown";
@@ -29,14 +25,9 @@ void request_init(AceRequest * r) {
     r->lm_top_p           = 0.9f;
     r->lm_top_k           = 0;
     r->lm_negative_prompt = "";
-    r->reference_audio    = "";
-    r->src_audio          = "";
     r->audio_codes        = "";
-    r->audio_cover_strength = 1.0f;
-    r->repainting_start   = 0.0f;
-    r->repainting_end     = 0.0f;
     r->inference_steps    = 8;
-    r->guidance_scale     = 1.0f;
+    r->guidance_scale     = 0.0f;
     r->shift              = 3.0f;
 }
 
@@ -226,18 +217,11 @@ bool request_parse(AceRequest * r, const char * path) {
         const std::string & v = kv.value;
 
         // strings
-        if      (k == "task_type")          r->task_type          = v;
-        else if (k == "caption")            r->caption            = v;
+        if      (k == "caption")            r->caption            = v;
         else if (k == "lyrics")             r->lyrics             = v;
-        else if (k == "custom_tag")         r->custom_tag         = v;
-        else if (k == "genre")              r->genre             = v;
         else if (k == "keyscale")           r->keyscale           = v;
-        else if (k == "formatted_lyrics")    r->lyrics             = v;  // alias for lyrics
-        else if (k == "language")           r->vocal_language    = v;  // alias for vocal_language
         else if (k == "timesignature")      r->timesignature      = v;
         else if (k == "vocal_language")     r->vocal_language     = v;
-        else if (k == "reference_audio")   r->reference_audio    = v;
-        else if (k == "src_audio")          r->src_audio          = v;
         else if (k == "audio_codes")        r->audio_codes        = v;
         else if (k == "lm_negative_prompt") r->lm_negative_prompt = v;
 
@@ -251,16 +235,11 @@ bool request_parse(AceRequest * r, const char * path) {
         else if (k == "lm_cfg_scale")       r->lm_cfg_scale       = (float)atof(v.c_str());
         else if (k == "lm_top_p")           r->lm_top_p           = (float)atof(v.c_str());
         else if (k == "lm_top_k")           r->lm_top_k           = atoi(v.c_str());
-        else if (k == "audio_cover_strength") r->audio_cover_strength = (float)atof(v.c_str());
-        else if (k == "repainting_start")   r->repainting_start   = (float)atof(v.c_str());
-        else if (k == "repainting_end")     r->repainting_end    = (float)atof(v.c_str());
         else if (k == "inference_steps")    r->inference_steps    = atoi(v.c_str());
         else if (k == "guidance_scale")     r->guidance_scale     = (float)atof(v.c_str());
         else if (k == "shift")              r->shift              = (float)atof(v.c_str());
 
         // bools
-        else if (k == "instrumental")       r->instrumental       = (v == "true");
-        else if (k == "is_instrumental")    r->instrumental       = (v == "true");
         // unknown keys: silently ignored (forward compat)
     }
 
@@ -276,15 +255,8 @@ bool request_write(const AceRequest * r, const char * path) {
     }
 
     fprintf(f, "{\n");
-    fprintf(f, "  \"task_type\": \"%s\",\n",         json_escape(r->task_type).c_str());
     fprintf(f, "  \"caption\": \"%s\",\n",            json_escape(r->caption).c_str());
     fprintf(f, "  \"lyrics\": \"%s\",\n",             json_escape(r->lyrics).c_str());
-    if (r->instrumental)
-        fprintf(f, "  \"instrumental\": true,\n");
-    if (!r->custom_tag.empty())
-        fprintf(f, "  \"custom_tag\": \"%s\",\n",     json_escape(r->custom_tag).c_str());
-    if (!r->genre.empty())
-        fprintf(f, "  \"genre\": \"%s\",\n",          json_escape(r->genre).c_str());
     fprintf(f, "  \"bpm\": %d,\n",                    r->bpm);
     fprintf(f, "  \"duration\": %.1f,\n",             r->duration);
     fprintf(f, "  \"keyscale\": \"%s\",\n",           json_escape(r->keyscale).c_str());
@@ -296,18 +268,10 @@ bool request_write(const AceRequest * r, const char * path) {
     fprintf(f, "  \"lm_top_p\": %.2f,\n",             r->lm_top_p);
     fprintf(f, "  \"lm_top_k\": %d,\n",               r->lm_top_k);
     fprintf(f, "  \"lm_negative_prompt\": \"%s\",\n", json_escape(r->lm_negative_prompt).c_str());
-    if (!r->reference_audio.empty())
-        fprintf(f, "  \"reference_audio\": \"%s\",\n", json_escape(r->reference_audio).c_str());
-    if (!r->src_audio.empty())
-        fprintf(f, "  \"src_audio\": \"%s\",\n",       json_escape(r->src_audio).c_str());
-    fprintf(f, "  \"audio_cover_strength\": %.2f,\n", r->audio_cover_strength);
-    if (r->repainting_start != 0.0f || r->repainting_end != 0.0f) {
-        fprintf(f, "  \"repainting_start\": %.1f,\n", r->repainting_start);
-        fprintf(f, "  \"repainting_end\": %.1f,\n",   r->repainting_end);
-    }
     fprintf(f, "  \"inference_steps\": %d,\n",        r->inference_steps);
     fprintf(f, "  \"guidance_scale\": %.1f,\n",       r->guidance_scale);
     fprintf(f, "  \"shift\": %.1f,\n",                r->shift);
+    // audio_codes last (no trailing comma)
     fprintf(f, "  \"audio_codes\": \"%s\"\n",         json_escape(r->audio_codes).c_str());
     fprintf(f, "}\n");
 
@@ -317,12 +281,10 @@ bool request_write(const AceRequest * r, const char * path) {
 }
 
 void request_dump(const AceRequest * r, FILE * f) {
-    fprintf(f, "[Request] task=%s seed=%lld\n", r->task_type.c_str(), (long long)r->seed);
+    fprintf(f, "[Request] seed=%lld\n", (long long)r->seed);
     fprintf(f, "  caption:    %.60s%s\n",
             r->caption.c_str(), r->caption.size() > 60 ? "..." : "");
     fprintf(f, "  lyrics:     %zu bytes\n", r->lyrics.size());
-    if (!r->custom_tag.empty())
-        fprintf(f, "  custom_tag: %s\n", r->custom_tag.c_str());
     fprintf(f, "  bpm=%d dur=%.0f key=%s ts=%s lang=%s\n",
             r->bpm, r->duration, r->keyscale.c_str(),
             r->timesignature.c_str(), r->vocal_language.c_str());
@@ -330,12 +292,6 @@ void request_dump(const AceRequest * r, FILE * f) {
             r->lm_temperature, r->lm_cfg_scale, r->lm_top_p, r->lm_top_k);
     fprintf(f, "  dit: steps=%d guidance=%.1f shift=%.1f\n",
             r->inference_steps, r->guidance_scale, r->shift);
-    if (!r->reference_audio.empty())
-        fprintf(f, "  reference_audio: %s\n", r->reference_audio.c_str());
-    if (!r->src_audio.empty())
-        fprintf(f, "  src_audio: %s\n", r->src_audio.c_str());
-    fprintf(f, "  audio_codes: %s  cover_strength=%.2f\n",
-            r->audio_codes.empty() ? "(none)" : "(present)", r->audio_cover_strength);
-    if (r->repainting_start != 0.0f || r->repainting_end != 0.0f)
-        fprintf(f, "  repaint: %.1f–%.1fs\n", r->repainting_start, r->repainting_end);
+    fprintf(f, "  audio_codes: %s\n",
+            r->audio_codes.empty() ? "(none)" : "(present)");
 }

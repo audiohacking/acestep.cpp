@@ -10,13 +10,10 @@
 
 #pragma once
 #include "qwen3-enc.h"
-#include <vector>
 
 // FSQ constants
 static const int FSQ_NDIMS = 6;
 static const int FSQ_LEVELS[6] = {8, 8, 8, 5, 5, 5};
-static const int FSQ_N_CODES = 8 * 8 * 8 * 5 * 5 * 5;  // 8000
-static const int FSQ_FRAMES_PER_CODE = 5;
 
 // FSQ decode: integer index -> 6 normalized float values
 // Each dimension: level_idx / ((L-1)/2) - 1.0  (maps to [-1, 1])
@@ -113,6 +110,10 @@ static bool detok_ggml_load(DetokGGML * m, const char * gguf_path,
     ggml_backend_t backends[2] = { backend, cpu_backend };
     int n = (backend == cpu_backend) ? 1 : 2;
     m->sched = ggml_backend_sched_new(backends, NULL, n, 4096, false, true);
+    if (!m->sched) {
+        fprintf(stderr, "[FSQ] FATAL: failed to create scheduler\n");
+        return false;
+    }
 
     fprintf(stderr, "[Load] Detokenizer: FSQ(6->2048) + 2L encoder(S=5, 2048->64)\n");
     return true;
@@ -218,48 +219,6 @@ static int detok_ggml_decode(DetokGGML * m, const int * codes, int T_5Hz,
     ggml_backend_sched_reset(m->sched);
     ggml_free(ctx);
     return T_25Hz;
-}
-
-// Build codeword table for latent->code (cover from file): for each code 0..FSQ_N_CODES-1,
-// decode to 5*64 floats. table_out must be at least FSQ_N_CODES * FSQ_FRAMES_PER_CODE * 64 floats.
-static void detok_ggml_build_codeword_table(DetokGGML * m, float * table_out) {
-    const int chunk = FSQ_FRAMES_PER_CODE * 64;
-    for (int i = 0; i < FSQ_N_CODES; i++) {
-        int n = detok_ggml_decode(m, &i, 1, table_out + (size_t)i * chunk);
-        (void)n;
-    }
-}
-
-// Encode latent frames to 5Hz codes by nearest codeword. T_latent = number of 25Hz frames (64-d each).
-// Groups frames in chunks of 5; for each chunk finds the code whose codeword minimizes L2 distance.
-// codeword_table from detok_ggml_build_codeword_table (FSQ_N_CODES * 5 * 64 floats).
-// Pads last chunk with zeros if T_latent not divisible by 5.
-static void latent_frames_to_codes(int T_latent, const float * latent_64d,
-                                   const float * codeword_table,
-                                   std::vector<int> * out_codes) {
-    out_codes->clear();
-    const int chunk_frames = FSQ_FRAMES_PER_CODE;
-    const int chunk_size = chunk_frames * 64;
-    int n_chunks = T_latent / chunk_frames;
-    if (n_chunks <= 0) return;
-    for (int g = 0; g < n_chunks; g++) {
-        const float * chunk = latent_64d + (size_t)g * chunk_size;
-        int best = 0;
-        float best_d2 = 1e30f;
-        for (int i = 0; i < FSQ_N_CODES; i++) {
-            const float * cw = codeword_table + (size_t)i * chunk_size;
-            float d2 = 0.0f;
-            for (int j = 0; j < chunk_size; j++) {
-                float d = chunk[j] - cw[j];
-                d2 += d * d;
-            }
-            if (d2 < best_d2) {
-                best_d2 = d2;
-                best = i;
-            }
-        }
-        out_codes->push_back(best);
-    }
 }
 
 // Free

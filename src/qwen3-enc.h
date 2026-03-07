@@ -17,7 +17,6 @@
 #include "gguf-weights.h"
 #include <cmath>
 #include <cstdio>
-#include <cstring>
 #include <string>
 #include <vector>
 
@@ -404,7 +403,10 @@ static void qwen3_forward(Qwen3GGML * m, const int * token_ids, int S, float * o
     ggml_build_forward_expand(gf, out);
 
     // Allocate
-    ggml_backend_sched_alloc_graph(m->sched, gf);
+    if (!ggml_backend_sched_alloc_graph(m->sched, gf)) {
+        fprintf(stderr, "[TextEncoder] FATAL: failed to allocate graph (%d tokens)\n", S);
+        exit(1);
+    }
 
     // Set inputs
     ggml_backend_tensor_set(t_ids, token_ids, 0, S * sizeof(int));
@@ -455,7 +457,10 @@ static void qwen3_embed_lookup(Qwen3GGML * m, const int * token_ids, int S, floa
     ggml_set_output(out);
     ggml_build_forward_expand(gf, out);
 
-    ggml_backend_sched_alloc_graph(m->sched, gf);
+    if (!ggml_backend_sched_alloc_graph(m->sched, gf)) {
+        fprintf(stderr, "[TextEncoder] FATAL: failed to allocate graph (embed lookup, %d tokens)\n", S);
+        exit(1);
+    }
     ggml_backend_tensor_set(t_ids, token_ids, 0, S * sizeof(int));
     ggml_backend_sched_graph_compute(m->sched, gf);
     ggml_backend_tensor_get(out, output, 0, (size_t)H * S * sizeof(float));

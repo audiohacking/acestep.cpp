@@ -270,7 +270,10 @@ static void cond_ggml_forward(CondGGML * m,
     if (timbre_out) ggml_build_forward_expand(gf, timbre_out);
 
     // Allocate and set inputs
-    ggml_backend_sched_alloc_graph(m->sched, gf);
+    if (!ggml_backend_sched_alloc_graph(m->sched, gf)) {
+        fprintf(stderr, "[CondEncoder] FATAL: failed to allocate graph\n");
+        exit(1);
+    }
 
     ggml_backend_tensor_set(t_lyric_in, lyric_embed, 0, 1024 * S_lyric * sizeof(float));
     ggml_backend_tensor_set(t_text_in, text_hidden, 0, 1024 * S_text * sizeof(float));

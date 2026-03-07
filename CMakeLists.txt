@@ -15,7 +15,12 @@ add_compile_definitions(GGML_MAX_NAME=128)
 # CUDA architectures: cover Turing to Blackwell for distributed binaries.
 # Users can override with -DCMAKE_CUDA_ARCHITECTURES=native for local builds.
 if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-    set(CMAKE_CUDA_ARCHITECTURES "75-virtual;80-virtual;86-real;89-real;120a-real;121a-real")
+    find_package(CUDAToolkit QUIET)
+    if(CUDAToolkit_FOUND AND CUDAToolkit_VERSION VERSION_GREATER_EQUAL "12.8")
+        set(CMAKE_CUDA_ARCHITECTURES "75-virtual;80-virtual;86-real;89-real;120a-real;121a-real")
+    else()
+        set(CMAKE_CUDA_ARCHITECTURES "75-virtual;80-virtual;86-real;89-real")
+    endif()
 endif()
 
 # ggml as subdirectory, inherits GGML_CUDA, GGML_METAL, etc. from cmake flags
@@ -54,13 +59,11 @@ endmacro()
 # Core library (shared between binaries)
 add_library(acestep-core STATIC
     src/request.cpp
-    src/audio_loader.cpp
 )
 link_ggml_backends(acestep-core)
-target_include_directories(acestep-core PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 
-# dit-vae: full pipeline (text-enc + cond + dit + vae + wav) + LoRA support
-add_executable(dit-vae tools/dit-vae.cpp src/dit-lora.cpp)
+# dit-vae: full pipeline (text-enc + cond + dit + vae + wav)
+add_executable(dit-vae tools/dit-vae.cpp)
 target_link_libraries(dit-vae PRIVATE acestep-core)
 link_ggml_backends(dit-vae)
 
@@ -72,3 +75,7 @@ link_ggml_backends(ace-qwen3)
 # quantize: GGUF requantizer (BF16 -> K-quants)
 add_executable(quantize tools/quantize.cpp)
 link_ggml_backends(quantize)
+
+# neural-codec: Oobleck VAE neural audio codec (encode/decode WAV <-> latent)
+add_executable(neural-codec tools/neural-codec.cpp)
+link_ggml_backends(neural-codec)

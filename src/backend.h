@@ -13,6 +13,7 @@
 extern "C" int cudaDeviceGetAttribute(int *, int, int);
 #endif
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <thread>
 
@@ -41,6 +42,10 @@ static BackendPair backend_init(const char * label) {
     ggml_backend_load_all();
     BackendPair bp = {};
     bp.backend = ggml_backend_init_best();
+    if (!bp.backend) {
+        fprintf(stderr, "[Load] FATAL: no backend available\n");
+        exit(1);
+    }
     int n_threads = (int)std::thread::hardware_concurrency() / 2;
     if (n_threads < 1) n_threads = 1;
     // [GGML] If best backend is already CPU, reuse it (avoid 2 CPU instances
@@ -51,6 +56,10 @@ static BackendPair backend_init(const char * label) {
         ggml_backend_cpu_set_n_threads(bp.backend, n_threads);
     } else {
         bp.cpu_backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, NULL);
+        if (!bp.cpu_backend) {
+            fprintf(stderr, "[Load] FATAL: failed to init CPU backend\n");
+            exit(1);
+        }
         ggml_backend_cpu_set_n_threads(bp.cpu_backend, n_threads);
     }
     fprintf(stderr, "[Load] %s backend: %s (CPU threads: %d)\n",
@@ -87,5 +96,10 @@ static void backend_release(ggml_backend_t backend, ggml_backend_t cpu_backend) 
 static ggml_backend_sched_t backend_sched_new(BackendPair bp, int max_nodes) {
     ggml_backend_t backends[2] = { bp.backend, bp.cpu_backend };
     int n = (bp.backend == bp.cpu_backend) ? 1 : 2;
-    return ggml_backend_sched_new(backends, NULL, n, max_nodes, false, true);
+    ggml_backend_sched_t sched = ggml_backend_sched_new(backends, NULL, n, max_nodes, false, true);
+    if (!sched) {
+        fprintf(stderr, "[Load] FATAL: failed to create scheduler\n");
+        exit(1);
+    }
+    return sched;
 }

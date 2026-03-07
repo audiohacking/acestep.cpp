@@ -1,7 +1,7 @@
 # acestep.cpp
 
 Portable C++17 implementation of ACE-Step 1.5 music generation using GGML.
-Text + lyrics in, stereo 48kHz WAV out. Runs on CPU, CUDA, Metal, Vulkan.
+Text + lyrics in, stereo 48kHz WAV out. Runs on CPU, CUDA, ROCm, Metal, Vulkan.
 
 ## Build
 
@@ -16,6 +16,9 @@ cmake ..
 # Linux with NVIDIA GPU
 cmake .. -DGGML_CUDA=ON
 
+# Linux with AMD GPU (ROCm)
+cmake .. -DGGML_HIP=ON
+
 # Linux with Vulkan
 cmake .. -DGGML_VULKAN=ON
 
@@ -29,7 +32,7 @@ cmake .. -DGGML_CUDA=ON -DGGML_BLAS=ON
 cmake --build . --config Release -j$(nproc)
 ```
 
-Builds two binaries: `ace-qwen3` (LLM) and `dit-vae` (DiT + VAE).
+Builds three binaries: `ace-qwen3` (LLM), `dit-vae` (DiT + VAE) and `neural-codec` (VAE encode/decode).
 
 ## Models
 
@@ -94,13 +97,13 @@ EOF
 # LLM: request.json -> request0.json (enriched with lyrics + codes)
 ./build/ace-qwen3 \
     --request /tmp/request.json \
-    --model models/acestep-5Hz-lm-4B-BF16.gguf
+    --model models/acestep-5Hz-lm-4B-Q8_0.gguf
 
 # DiT+VAE: request0.json -> request00.wav
 ./build/dit-vae \
     --request /tmp/request0.json \
-    --text-encoder models/Qwen3-Embedding-0.6B-BF16.gguf \
-    --dit models/acestep-v15-turbo-BF16.gguf \
+    --text-encoder models/Qwen3-Embedding-0.6B-Q8_0.gguf \
+    --dit models/acestep-v15-turbo-Q8_0.gguf \
     --vae models/vae-BF16.gguf
 ```
 
@@ -111,7 +114,7 @@ Generate multiple songs at once with `--batch`:
 # -> request0.json, request1.json (different lyrics/codes, seeds auto+0, auto+1)
 ./build/ace-qwen3 \
     --request /tmp/request.json \
-    --model models/acestep-5Hz-lm-4B-BF16.gguf \
+    --model models/acestep-5Hz-lm-4B-Q8_0.gguf \
     --batch 2
 
 # DiT+VAE: (2 DiT variations of LM output 1 and 2)
@@ -119,8 +122,8 @@ Generate multiple songs at once with `--batch`:
 # -> request1.json -> request10.wav, request11.wav
 ./build/dit-vae \
     --request /tmp/request0.json /tmp/request1.json \
-    --text-encoder models/Qwen3-Embedding-0.6B-BF16.gguf \
-    --dit models/acestep-v15-turbo-BF16.gguf \
+    --text-encoder models/Qwen3-Embedding-0.6B-Q8_0.gguf \
+    --dit models/acestep-v15-turbo-Q8_0.gguf \
     --vae models/vae-BF16.gguf \
     --batch 2
 ```
@@ -151,34 +154,43 @@ Empty field = "fill it". Filled = "don't touch".
 All modes always output numbered files (`request0.json` .. `requestN-1.json`).
 The input JSON is never modified.
 
-**Caption only**: the LLM generates lyrics, metadata (bpm, key, time
-signature, duration) and audio codes. With `--batch N`, each element
-generates its own lyrics and metadata from a different seed, producing
-N completely different songs. See `examples/simple.json`.
+**Caption only** (`lyrics=""`): two LLM passes. Phase 1 uses the "Expand"
+prompt to generate lyrics and metadata (bpm, keyscale, timesignature,
+duration) via CoT. Phase 2 reinjects the CoT and generates audio codes using
+the "Generate tokens" prompt. CFG is forced to 1.0 in phase 1 (free
+sampling); `lm_cfg_scale` only applies in phase 2. With `--batch N`, each
+element runs its own phase 1 from a different seed, producing N completely
+different songs. See `examples/simple.json`.
 
-**Caption + lyrics (+ optional metadata)**: the LLM fills missing
-metadata via CoT, then generates audio codes. User provided fields
-are preserved. See `examples/partial.json`.
+**Caption + lyrics (+ optional metadata)**: single LLM pass. The "Generate
+tokens" prompt is used directly. Missing metadata is filled via CoT, then
+audio codes are generated. User-provided fields are never overwritten.
+`lm_cfg_scale` applies to both CoT and code generation. See
+`examples/partial.json`.
 
 **Everything provided** (caption, lyrics, bpm, duration, keyscale,
 timesignature): the LLM skips CoT and generates audio codes directly.
 With `--batch N`, all elements share the same prompt (single prefill,
 KV cache copied). See `examples/full.json`.
 
+**Instrumental** (`lyrics="[Instrumental]"`): treated as "lyrics provided",
+so the single-pass "Generate tokens" path is used. No lyrics generation.
+The DiT was trained with this exact string as the no-vocal condition.
+
 **Passthrough** (`audio_codes` present): LLM is skipped entirely.
 Run `dit-vae` to decode existing codes. See `examples/dit-only.json`.
 
 ## Request JSON reference
 
-All fields with defaults. Only `caption` is required.
+Only `caption` is required. All other fields default to "unset" which means
+the LLM fills them, or a sensible runtime default is applied.
 
 ```json
 {
     "caption":            "",
     "lyrics":             "",
-    "instrumental":       false,
     "bpm":                0,
-    "duration":           -1,
+    "duration":           0,
     "keyscale":           "",
     "timesignature":      "",
     "vocal_language":     "unknown",
@@ -190,18 +202,98 @@ All fields with defaults. Only `caption` is required.
     "lm_negative_prompt": "",
     "audio_codes":        "",
     "inference_steps":    8,
-    "guidance_scale":     7.0,
+    "guidance_scale":     0.0,
     "shift":              3.0
 }
 ```
 
-Key fields: `seed` -1 means random (resolved once, then +1 per batch
-element). `audio_codes` is generated by ace-qwen3 and consumed by
-dit-vae (comma separated FSQ token IDs). When present, the LLM is
-skipped entirely.
+### Text conditioning (ace-qwen3 + dit-vae)
 
-Turbo preset: `inference_steps=8, shift=3.0` (no guidance_scale, turbo models don't use CFG).
-SFT preset: `inference_steps=50, guidance_scale=4.0, shift=6.0`.
+**`caption`** (string, required)
+Natural language description of the music style, mood, instruments, etc.
+Fed to both the LLM and the DiT text encoder.
+
+**`lyrics`** (string, default `""`)
+Controls vocal generation. Three valid states:
+- `""`: LLM generates lyrics from the caption (phase 1 "Expand" prompt).
+- `"[Instrumental]"`: no vocals. Passed directly to the DiT, LLM skips lyrics generation.
+- Any other string: user-provided lyrics used as-is, LLM only fills missing metadata.
+
+There is no `instrumental` flag. This field is the single source of truth for
+vocal content.
+
+### Metadata (LLM-filled if unset)
+
+**`bpm`** (int, default `0` = unset)
+Beats per minute. LLM generates one if 0.
+
+**`duration`** (float seconds, default `0` = unset)
+Target audio duration. `0` means the LLM picks it. Clamped to [1, 600]s after
+generation. `1` means 1 second.
+
+**`keyscale`** (string, default `""` = unset)
+Musical key and scale, e.g. `"C major"`, `"F# minor"`. LLM fills if empty.
+
+**`timesignature`** (string, default `""` = unset)
+Time signature numerator as a string, e.g. `"4"` for 4/4, `"3"` for 3/4.
+LLM fills if empty.
+
+**`vocal_language`** (string, default `"unknown"`)
+BCP-47 language code for lyrics, e.g. `"en"`, `"fr"`, `"ja"`. When set and
+lyrics are being generated, the FSM constrains the LLM output to that language.
+`"unknown"` lets the LLM decide.
+
+### Generation control
+
+**`seed`** (int64, default `-1` = random)
+RNG seed. Resolved once at startup to a random value if -1. Batch elements
+use `seed+0`, `seed+1`, ... `seed+N-1`.
+
+**`audio_codes`** (string, default `""`)
+Comma-separated FSQ token IDs produced by ace-qwen3. When non-empty, the
+entire LLM pass is skipped and dit-vae decodes these codes directly
+(passthrough / cover mode).
+
+### LM sampling (ace-qwen3)
+
+**`lm_temperature`** (float, default `0.85`)
+Sampling temperature for both phase 1 (lyrics/metadata) and phase 2 (audio
+codes). Lower = more deterministic.
+
+**`lm_cfg_scale`** (float, default `2.0`)
+Classifier-Free Guidance scale for the LM. Only active in phase 2 (audio
+code generation) and in phase 1 when lyrics are already provided. When
+`lyrics` is empty, phase 1 always runs with `cfg=1.0` (free sampling).
+`1.0` disables CFG.
+
+**`lm_top_p`** (float, default `0.9`)
+Nucleus sampling cutoff. `1.0` disables. When `top_k=0`, an internal
+pre-filter of 256 tokens is applied before top_p for performance.
+
+**`lm_top_k`** (int, default `0` = disabled)
+Top-K sampling. `0` disables hard top-K (top_p still applies).
+
+**`lm_negative_prompt`** (string, default `""`)
+Negative caption for CFG in phase 2. Empty string falls back to a
+caption-less unconditional prompt.
+
+### DiT flow matching (dit-vae)
+
+**`inference_steps`** (int, default `8`)
+Number of diffusion denoising steps. Turbo preset: `8`. SFT preset: `50`.
+
+**`guidance_scale`** (float, default `0.0` = auto)
+CFG scale for the DiT. `0.0` is resolved at runtime:
+- Turbo models: forced to `1.0` (CFG disabled, turbo was trained without it).
+- SFT/base models: `7.0`.
+Any value > 1.0 on a turbo model is overridden to 1.0 with a warning.
+
+**`shift`** (float, default `3.0`)
+Flow-matching schedule shift. Controls the timestep distribution.
+`shift = s*t / (1 + (s-1)*t)`. Turbo preset: `3.0`. SFT preset: `6.0`.
+
+Turbo preset: `inference_steps=8, shift=3.0` (guidance_scale auto-resolved to 1.0).
+SFT preset: `inference_steps=50, guidance_scale=7.0, shift=6.0`.
 
 ## ace-qwen3 reference
 
@@ -258,6 +350,71 @@ Debug:
 
 Models are loaded once and reused across all requests.
 
+## neural-codec
+
+GGML-native neural audio codec based on the Oobleck VAE encoder and decoder.
+Serves two purposes: validating the precision of the full VAE chain (encode +
+decode roundtrip), and compressing music at ~850 B/s with no perceptible
+difference from the original.
+
+```
+Usage: neural-codec --vae <gguf> --encode|--decode -i <input> [-o <o>] [--q8|--q4]
+
+Required:
+  --vae <path>            VAE GGUF file
+  --encode | --decode     Encode WAV to latent, or decode latent to WAV
+  -i <path>               Input (WAV for encode, latent for decode)
+
+Output:
+  -o <path>               Output file (auto-named if omitted)
+  --q8                    Quantize latent to int8 (~13 kbit/s)
+  --q4                    Quantize latent to int4 (~6.8 kbit/s)
+
+Output naming: song.wav -> song.latent (f32) or song.nac8 (Q8) or song.nac4 (Q4)
+               song.latent -> song.wav
+
+VAE tiling (memory control):
+  --vae-chunk <N>         Latent frames per tile (default: 256)
+  --vae-overlap <N>       Overlap frames per side (default: 64)
+
+Latent formats (decode auto-detects):
+  f32:  flat [T, 64] f32, no header. ~51 kbit/s.
+  NAC8: header + per-frame Q8. ~13 kbit/s.
+  NAC4: header + per-frame Q4. ~6.8 kbit/s.
+```
+
+The encoder is the symmetric mirror of the decoder: same snake activations,
+same residual units, strided conv1d for downsampling instead of transposed
+conv1d for upsampling. No new GGML ops. Downsample 2x4x4x6x10 = 1920x.
+
+48kHz stereo audio is compressed to 64-dimensional latent frames at 25 Hz.
+Three output formats, decode auto-detects from file content:
+
+| Format | Frame size | Bitrate | 3 min song | vs f32 (cossim) |
+|--------|-----------|---------|------------|-----------------|
+| f32    | 256B      | 51 kbit/s | 1.1 MB   | baseline        |
+| NAC8   | 66B       | 13 kbit/s | 290 KB   | 0.9999          |
+| NAC4   | 34B       | 6.8 kbit/s | 150 KB  | 0.989           |
+
+NAC = Neural Audio Codec. The NAC8 and NAC4 file formats are headerless
+except for a 4-byte magic (`NAC8` or `NAC4`) and a uint32 frame count.
+Q8 quantization error is 39 dB below the VAE reconstruction error (free).
+Q4 quantization error is 16 dB below the VAE reconstruction error (inaudible
+on most material).
+
+```bash
+# encode (Q4: 6.8 kbit/s, ~150 KB for 3 minutes)
+neural-codec --vae models/vae-BF16.gguf --encode --q4 -i song.wav -o song.nac4
+
+# encode (Q8: 13 kbit/s, ~290 KB for 3 minutes)
+neural-codec --vae models/vae-BF16.gguf --encode --q8 -i song.wav -o song.nac8
+
+# decode (auto-detects format)
+neural-codec --vae models/vae-BF16.gguf --decode -i song.nac4 -o song_decoded.wav
+
+# roundtrip validation: compare song.wav and song_decoded.wav with your ears
+```
+
 ## Architecture
 
 ```
@@ -277,6 +434,39 @@ dit-vae
   VAE (AutoencoderOobleck, tiled decode)
   WAV stereo 48kHz
 ```
+
+## Roadmap
+
+This project started from a simple idea: a Telegram bot using llama.cpp to
+prompt a music generator, and the desire to make GGML sing. No more, no less.
+No cloud, no black box, scriptable and nothing between you and the model.
+
+### LLM modes
+- [ ] Remaining modes: Understand, Rewrite (single-pass, no audio codes)
+- [ ] Reference audio input: repaint and cover tasks (src_audio + cover_strength)
+
+### Audio I/O
+Current: raw PCM f32 WAV via hand-rolled writer, no external deps.
+Trade-off to document:
+- **Keep as-is**: zero dependencies, clean licensing, works everywhere
+- **ffmpeg pipe**: trivial bash wrapper handles any codec/format, no C++ codec hell
+  - pro: MP3/FLAC/OGG out of the box, input resampling for reference audio
+  - con: runtime dependency, not embedded
+Conclusion pending. Likely ffmpeg as optional external pipe, documented in README.
+
+### API and interface
+- [ ] JSON HTTP server (minimal, well-documented, stable contract)
+- [ ] Web interface on top - vibecodeable by anyone, API stays simple
+Goal: document the internals and how the model actually works,
+not reproduce the Python spaghetti. Expert-first, no commercial fluff.
+
+### Documentation
+Current README is technical study + API reference, intentional.
+- [ ] Split when a user-facing interface exists: README (user) + ARCHITECTURE.md (internals)
+
+### Future models
+- [ ] ACE-Step 2.0: evaluate architecture delta, add headers/weights as needed
+No commitment, easy to adapt by adding headers or new compilation units as needed.
 
 ## LM specifics
 
@@ -318,7 +508,7 @@ python3 debug-dit-cossim.py       # DiT: per-layer cossim GGML vs Python (turbo/
 ## Patched GGML fork
 
 Uses a patched GGML fork (submodule) with two new ops, a Metal im2col optimization, and
-a CUDA bugfix for the Oobleck VAE decoder. All backends: CPU, CUDA, Metal, Vulkan.
+a CUDA bugfix for the Oobleck VAE decoder. All backends: CPU, CUDA, ROCm, Metal, Vulkan.
 F32/F16/BF16 data types. The DiT uses only standard GGML ops and needs no patches.
 
 The VAE reconstructs audio from latent space through 5 upsampling blocks (total 1920x),
@@ -373,6 +563,19 @@ Upstream `im2col_kernel` uses OW directly as grid dimension Y, which exceeds the
 times per tile at output widths up to 491520. Fixed with a grid-stride loop on OW and
 `MIN(OW, MAX_GRIDDIM_Z)` clamping.
 
+### Upstream divergence
+
+The GGML submodule diverges from upstream only by the addition of
+`GGML_OP_SNAKE` and `GGML_OP_COL2IM_1D`. No existing upstream kernel is
+modified. These ops are required; the VAE does not work without them.
+
+An earlier approach patched the upstream naive ops instead of adding custom
+ones. Those patches were dropped. They are documented here in case someone
+wants to study the naive path:
+
+- `conv_transpose_1d`: bounded loop replacing O(T_in) brute-force, CUDA and Metal
+- `im2col`: grid-stride loop on OW to fix gridDim.y overflow for large tensors
+
 ## Acknowledgements
 
 Independent implementation based on ACE-Step 1.5 by ACE Studio and StepFun.
@@ -387,3 +590,15 @@ All model weights are theirs, this is just a native backend.
 	note={GitHub repository}
 }
 ```
+
+## Samples
+
+https://github.com/user-attachments/assets/9a50c1f4-9ec0-474a-bd14-e8c6b00622a1
+
+https://github.com/user-attachments/assets/fb606249-0269-4153-b651-bf78e05baf22
+
+https://github.com/user-attachments/assets/e0580468-5e33-4a1f-a0f4-b914e4b9a8c2
+
+https://github.com/user-attachments/assets/292a31f1-f97e-4060-9207-ed8364d9a794
+
+https://github.com/user-attachments/assets/34b1b781-a5bc-46c4-90a6-615a10bc2c6a

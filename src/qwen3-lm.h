@@ -4,14 +4,11 @@
 #pragma once
 
 #include "qwen3-enc.h" // Qwen3Layer, Qwen3Config, layer build helpers
-#include "ggml-alloc.h"
-#include "bpe.h"
 
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
-#include <string>
 #include <vector>
 
 // LM config (superset of encoder config)
@@ -450,7 +447,10 @@ static void qw3lm_forward(Qwen3LM * m, const int * token_ids, int n_tokens,
     ggml_build_forward_expand(gf, lgt);
 
     // Schedule + allocate
-    ggml_backend_sched_alloc_graph(m->sched, gf);
+    if (!ggml_backend_sched_alloc_graph(m->sched, gf)) {
+        fprintf(stderr, "[LM] FATAL: failed to allocate graph (prefill, %d tokens)\n", n_tokens);
+        exit(1);
+    }
 
     // Set token IDs
     ggml_backend_tensor_set(token_ids_t, token_ids, 0, n_tokens * sizeof(int));
@@ -678,7 +678,10 @@ static void qw3lm_forward_batch(Qwen3LM * m, const int * token_ids,
     ggml_build_forward_expand(gf, lgt);
 
     // Allocate
-    ggml_backend_sched_alloc_graph(m->sched, gf);
+    if (!ggml_backend_sched_alloc_graph(m->sched, gf)) {
+        fprintf(stderr, "[LM] FATAL: failed to allocate graph (batch decode, N=%d)\n", N);
+        exit(1);
+    }
 
     // Set token IDs
     ggml_backend_tensor_set(token_ids_t, token_ids, 0, N * sizeof(int));
