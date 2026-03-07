@@ -1,0 +1,2 @@
+/usr/bin/ar qc libacestep-core.a "CMakeFiles/acestep-core.dir/src/request.cpp.o"
+/usr/bin/ranlib libacestep-core.a
