@@ -1,6 +1,5 @@
 {
-    "caption": "Upbeat pop rock anthem with driving electric guitars, punchy drums, catchy vocal hooks, and a singalong chorus",
-    "inference_steps": 8,
-    "shift": 3.0,
-    "vocal_language": "fr"
+    "caption": "Upbeat funk pop anthem with driving bassline, punchy drums",
+    "lyrics": "[Instrumental]",
+    "audio_cover_strength": 0.8
 }
