@@ -1,17 +1,18 @@
 // audio.h: unified audio reader supporting WAV and MP3 input formats.
 //
-// Decodes files via header-only libraries and, if necessary, resamples to
-// 48 kHz — the rate required by the ACEStep VAE encoder.  Channel layout is
-// preserved exactly as found in the source file; no up/down-mix is performed.
+// Decodes files via header-only libraries, resamples to 48 kHz if needed,
+// and always returns interleaved stereo float [T * 2] — the layout required
+// by the ACEStep VAE encoder.  Mono input is upmixed (L=R), N-channel input
+// uses the first two channels; no other manipulation is performed.
 //
 // Third-party header-only libraries used (thirdparty/):
 //   dr_wav.h  - WAV decoding  (public domain / MIT-0, mackron/dr_libs)
 //   dr_mp3.h  - MP3 decoding  (public domain / MIT-0, mackron/dr_libs)
 //
 // read_audio(path, T_audio, n_channels)
-//   Reads a WAV or MP3 file.  Returns a malloc'd interleaved float buffer
-//   [T * n_channels] at 48 kHz.  Sets *T_audio (frame count) and *n_channels.
-//   Returns NULL on error.  The caller is responsible for calling free().
+//   Reads a WAV or MP3 file.  Returns a malloc'd interleaved stereo float
+//   buffer [T * 2] at 48 kHz.  Sets *T_audio (frame count) and *n_channels
+//   (always 2 on success).  Returns NULL on error; caller frees on success.
 
 #pragma once
 #include <cctype>
@@ -77,15 +78,16 @@ static float * audio_resample_linear(const float * src, int T_src, int n_ch, int
 // Public API
 // ---------------------------------------------------------------------------
 
-// Read a WAV or MP3 file and return interleaved float PCM at 48 kHz.
+// Read a WAV or MP3 file, resample to 48 kHz if needed, and return
+// interleaved stereo float [T * 2] at 48 kHz.
 // Format is detected by file extension (.mp3 -> MP3, anything else -> WAV).
-// The native channel layout of the file is preserved unchanged.
-// If the source sample rate differs from 48 kHz, linear resampling is applied.
+// Mono input is upmixed to stereo (L = R = the single channel).
+// Multi-channel input (>2) uses the first two channels only.
 //
 // On success:
 //   *T_audio    <- number of PCM frames at 48 kHz
-//   *n_channels <- number of channels as encoded in the file (e.g. 2 = stereo)
-//   return value <- malloc'd buffer [T_audio * n_channels] floats; caller frees
+//   *n_channels <- always 2 (stereo)
+//   return value <- malloc'd buffer [T_audio * 2] floats; caller frees
 //
 // Returns NULL on failure.
 static float * read_audio(const char * path, int * T_audio, int * n_channels) {
@@ -143,7 +145,7 @@ static float * read_audio(const char * path, int * T_audio, int * n_channels) {
 
     if (channels == 0 || sr == 0 || n_frames <= 0) {
         fprintf(stderr, "[Audio] Empty or invalid audio file: %s\n", path);
-        drwav_free(raw, NULL);
+        free(raw);
         return NULL;
     }
 
@@ -157,7 +159,7 @@ static float * read_audio(const char * path, int * T_audio, int * n_channels) {
         fprintf(stderr, "[Audio] Resampling %u Hz -> 48000 Hz (%uch)...\n", sr, channels);
         int T_48k = 0;
         out = audio_resample_linear(raw, T_raw, (int) channels, (int) sr, &T_48k);
-        drwav_free(raw, NULL);
+        free(raw);
         if (!out) {
             fprintf(stderr, "[Audio] Resampling failed (out of memory)\n");
             return NULL;
@@ -167,10 +169,34 @@ static float * read_audio(const char * path, int * T_audio, int * n_channels) {
         out = raw;  // ownership transferred to caller
     }
 
-    fprintf(stderr, "[Audio] Ready: %d frames, %uch, 48 kHz (%.2fs)\n", T_raw, channels,
+    // -----------------------------------------------------------------------
+    // Upmix to stereo: vae-enc.h always reads [T, 2] interleaved stereo.
+    // Mono -> duplicate to stereo (L = R).
+    // N > 2 channels -> keep first two channels only.
+    // -----------------------------------------------------------------------
+    if ((int) channels != 2) {
+        int    n_ch_src = (int) channels;
+        float * stereo  = (float *) malloc((size_t) T_raw * 2 * sizeof(float));
+        if (!stereo) {
+            fprintf(stderr, "[Audio] Out of memory converting to stereo\n");
+            free(out);
+            return NULL;
+        }
+        for (int t = 0; t < T_raw; t++) {
+            float L             = out[(size_t) t * n_ch_src + 0];
+            float R             = (n_ch_src > 1) ? out[(size_t) t * n_ch_src + 1] : L;
+            stereo[t * 2 + 0]  = L;
+            stereo[t * 2 + 1]  = R;
+        }
+        free(out);
+        out = stereo;
+        fprintf(stderr, "[Audio] Converted %dch -> stereo\n", n_ch_src);
+    }
+
+    fprintf(stderr, "[Audio] Ready: %d stereo frames (%.2fs @ 48 kHz)\n", T_raw,
             (float) T_raw / 48000.0f);
     *T_audio    = T_raw;
-    *n_channels = (int) channels;
+    *n_channels = 2;
     return out;
 }
 
