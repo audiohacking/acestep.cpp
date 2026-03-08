@@ -540,11 +540,11 @@ static bool load_bpe_tokenizer(BPETokenizer * tok, const char * dir) {
     std::string merges_path = std::string(dir) + "/merges.txt";
 
     if (!load_vocab_json(vocab_path, tok->vocab)) {
-        fprintf(stderr, "ERROR: failed to load %s\n", vocab_path.c_str());
+        fprintf(stderr, "[BPE] ERROR: failed to load %s\n", vocab_path.c_str());
         return false;
     }
     if (!load_merges(merges_path, tok->merges)) {
-        fprintf(stderr, "ERROR: failed to load %s\n", merges_path.c_str());
+        fprintf(stderr, "[BPE] ERROR: failed to load %s\n", merges_path.c_str());
         return false;
     }
 

@@ -3,7 +3,6 @@
 // request.h - AceStep generation request (JSON serialization)
 //
 // Pure data container + JSON read/write. Zero business logic.
-// Aligned with Python GenerationParams (inference.py:39) and API /release_task.
 //
 
 #include <cstdint>
@@ -43,6 +42,12 @@ struct AceRequest {
 
     // cover mode (active when --src-audio is provided on CLI)
     float audio_cover_strength;  // 0.5 (0-1, fraction of DiT steps using source context)
+
+    // repaint mode (requires --src-audio)
+    // Both -1 = no repaint (plain cover). One or both >= 0 activates repaint.
+    // -1 on start means 0s, -1 on end means source duration.
+    float repainting_start;  // -1
+    float repainting_end;    // -1
 };
 
 // Initialize all fields to defaults (matches Python GenerationParams defaults)

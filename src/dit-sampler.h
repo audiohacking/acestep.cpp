@@ -188,7 +188,7 @@ static void dit_ggml_generate(DiTGGML *           model,
         }
     }
     if (!ggml_backend_sched_alloc_graph(model->sched, gf)) {
-        fprintf(stderr, "FATAL: failed to allocate graph\n");
+        fprintf(stderr, "[DiT] FATAL: failed to allocate graph\n");
         ggml_free(ctx);
         return;
     }

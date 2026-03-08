@@ -692,12 +692,12 @@ int main(int argc, char ** argv) {
     }
 
     if (!model_path) {
-        fprintf(stderr, "ERROR: --model required\n");
+        fprintf(stderr, "[CLI] ERROR: --model required\n");
         usage(argv[0]);
         return 1;
     }
     if (!request_path) {
-        fprintf(stderr, "ERROR: --request required\n");
+        fprintf(stderr, "[CLI] ERROR: --request required\n");
         usage(argv[0]);
         return 1;
     }
@@ -710,7 +710,7 @@ int main(int argc, char ** argv) {
     request_dump(&req, stderr);
 
     if (req.caption.empty()) {
-        fprintf(stderr, "ERROR: caption is empty in %s\n", request_path);
+        fprintf(stderr, "[Request] ERROR: caption is empty in %s\n", request_path);
         return 1;
     }
 

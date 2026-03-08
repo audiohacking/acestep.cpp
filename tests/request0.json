@@ -6,7 +6,6 @@
   "keyscale": "G major",
   "timesignature": "4",
   "vocal_language": "fr",
-  "task_type": "text2music",
   "seed": 158961132,
   "thinking": true,
   "lm_temperature": 0.85,

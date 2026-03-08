@@ -31,6 +31,8 @@ void request_init(AceRequest * r) {
     r->guidance_scale       = 0.0f;
     r->shift                = 3.0f;
     r->audio_cover_strength = 0.5f;
+    r->repainting_start     = -1.0f;
+    r->repainting_end       = -1.0f;
 }
 
 // JSON string escape / unescape
@@ -312,6 +314,10 @@ bool request_parse(AceRequest * r, const char * path) {
             r->shift = (float) atof(v.c_str());
         } else if (k == "audio_cover_strength") {
             r->audio_cover_strength = (float) atof(v.c_str());
+        } else if (k == "repainting_start") {
+            r->repainting_start = (float) atof(v.c_str());
+        } else if (k == "repainting_end") {
+            r->repainting_end = (float) atof(v.c_str());
         }
     }
 
@@ -344,6 +350,8 @@ bool request_write(const AceRequest * r, const char * path) {
     fprintf(f, "  \"guidance_scale\": %.1f,\n", r->guidance_scale);
     fprintf(f, "  \"shift\": %.1f,\n", r->shift);
     fprintf(f, "  \"audio_cover_strength\": %.2f,\n", r->audio_cover_strength);
+    fprintf(f, "  \"repainting_start\": %.1f,\n", r->repainting_start);
+    fprintf(f, "  \"repainting_end\": %.1f,\n", r->repainting_end);
     // audio_codes last (no trailing comma)
     fprintf(f, "  \"audio_codes\": \"%s\"\n", json_escape(r->audio_codes).c_str());
     fprintf(f, "}\n");
@@ -364,6 +372,9 @@ void request_dump(const AceRequest * r, FILE * f) {
     fprintf(f, "  dit: steps=%d guidance=%.1f shift=%.1f\n", r->inference_steps, r->guidance_scale, r->shift);
     if (r->audio_cover_strength != 0.5f) {
         fprintf(f, "  cover: strength=%.2f\n", r->audio_cover_strength);
+    }
+    if (r->repainting_start >= 0.0f || r->repainting_end >= 0.0f) {
+        fprintf(f, "  repaint: start=%.1f end=%.1f\n", r->repainting_start, r->repainting_end);
     }
     fprintf(f, "  audio_codes: %s\n", r->audio_codes.empty() ? "(none)" : "(present)");
 }

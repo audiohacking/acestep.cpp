@@ -120,21 +120,21 @@ int main(int argc, char ** argv) {
     }
 
     if (request_paths.empty()) {
-        fprintf(stderr, "ERROR: --request required\n");
+        fprintf(stderr, "[CLI] ERROR: --request required\n");
         print_usage(argv[0]);
         return 1;
     }
     if (batch_n < 1 || batch_n > 9) {
-        fprintf(stderr, "ERROR: --batch must be 1..9\n");
+        fprintf(stderr, "[CLI] ERROR: --batch must be 1..9\n");
         return 1;
     }
     if (!dit_gguf) {
-        fprintf(stderr, "ERROR: --dit required\n");
+        fprintf(stderr, "[CLI] ERROR: --dit required\n");
         print_usage(argv[0]);
         return 1;
     }
     if (!text_enc_gguf) {
-        fprintf(stderr, "ERROR: --text-encoder required\n");
+        fprintf(stderr, "[CLI] ERROR: --text-encoder required\n");
         print_usage(argv[0]);
         return 1;
     }
@@ -157,7 +157,7 @@ int main(int argc, char ** argv) {
 
     timer.reset();
     if (!dit_ggml_load(&model, dit_gguf, cfg)) {
-        fprintf(stderr, "FATAL: failed to load DiT model\n");
+        fprintf(stderr, "[DiT] FATAL: failed to load model\n");
         return 1;
     }
     fprintf(stderr, "[Load] DiT weight load: %.1f ms\n", timer.ms());
@@ -175,14 +175,14 @@ int main(int argc, char ** argv) {
                 memcpy(silence_full.data(), sl_data, 15000 * 64 * sizeof(float));
                 fprintf(stderr, "[Load] silence_latent: [15000, 64] from GGUF\n");
             } else {
-                fprintf(stderr, "FATAL: silence_latent tensor not found in %s\n", dit_gguf);
+                fprintf(stderr, "[DiT] FATAL: silence_latent tensor not found in %s\n", dit_gguf);
                 gf_close(&gf);
                 dit_ggml_free(&model);
                 return 1;
             }
             gf_close(&gf);
         } else {
-            fprintf(stderr, "FATAL: cannot reopen %s for metadata\n", dit_gguf);
+            fprintf(stderr, "[DiT] FATAL: cannot reopen %s for metadata\n", dit_gguf);
             dit_ggml_free(&model);
             return 1;
         }
@@ -208,14 +208,14 @@ int main(int argc, char ** argv) {
     int                T_cover = 0;
     if (src_audio_path) {
         if (!vae_gguf) {
-            fprintf(stderr, "ERROR: --src-audio requires --vae\n");
+            fprintf(stderr, "[Cover] ERROR: --src-audio requires --vae\n");
             return 1;
         }
         timer.reset();
         int     T_audio = 0, wav_n_ch = 0;
         float * wav_data = read_audio(src_audio_path, &T_audio, &wav_n_ch);
         if (!wav_data) {
-            fprintf(stderr, "FATAL: cannot read --src-audio %s\n", src_audio_path);
+            fprintf(stderr, "[Cover] FATAL: cannot read --src-audio %s\n", src_audio_path);
             return 1;
         }
         if (wav_n_ch != 2) {
@@ -231,7 +231,7 @@ int main(int argc, char ** argv) {
             vae_enc_encode_tiled(&vae_enc, wav_data, T_audio, cover_latents.data(), max_T_lat, vae_chunk, vae_overlap);
         free(wav_data);
         if (T_cover < 0) {
-            fprintf(stderr, "FATAL: VAE encode of src_audio failed\n");
+            fprintf(stderr, "[VAE-Enc] FATAL: encode failed\n");
             vae_enc_free(&vae_enc);
             return 1;
         }
@@ -259,11 +259,11 @@ int main(int argc, char ** argv) {
         AceRequest req;
         request_init(&req);
         if (!request_parse(&req, rpath)) {
-            fprintf(stderr, "ERROR: failed to parse %s, skipping\n", rpath);
+            fprintf(stderr, "[Request] ERROR: failed to parse %s, skipping\n", rpath);
             continue;
         }
         if (req.caption.empty()) {
-            fprintf(stderr, "ERROR: caption is empty in %s, skipping\n", rpath);
+            fprintf(stderr, "[Request] ERROR: caption is empty in %s, skipping\n", rpath);
             continue;
         }
 
@@ -334,7 +334,7 @@ int main(int argc, char ** argv) {
                 guidance_scale, shift, duration);
 
         if (T > 15000) {
-            fprintf(stderr, "ERROR: T=%d exceeds silence_latent max 15000, skipping\n", T);
+            fprintf(stderr, "[Pipeline] ERROR: T=%d exceeds silence_latent max 15000, skipping\n", T);
             continue;
         }
 
@@ -343,7 +343,7 @@ int main(int argc, char ** argv) {
         timer.reset();
         BPETokenizer tok;
         if (!load_bpe_from_gguf(&tok, text_enc_gguf)) {
-            fprintf(stderr, "FATAL: failed to load tokenizer from %s\n", text_enc_gguf);
+            fprintf(stderr, "[BPE] FATAL: failed to load tokenizer from %s\n", text_enc_gguf);
             dit_ggml_free(&model);
             if (have_vae) {
                 vae_ggml_free(&vae);
@@ -352,14 +352,48 @@ int main(int argc, char ** argv) {
         }
         fprintf(stderr, "[Load] BPE tokenizer: %.1f ms\n", timer.ms());
 
+        // Repaint mode: resolve start/end, requires --src-audio
+        // Both -1 = inactive. One or both >= 0 activates repaint.
+        bool  is_repaint = false;
+        float rs         = req.repainting_start;
+        float re         = req.repainting_end;
+        if (rs >= 0.0f || re >= 0.0f) {
+            if (!have_cover) {
+                fprintf(stderr, "[Repaint] ERROR: repainting_start/end require --src-audio\n");
+                return 1;
+            }
+            float src_dur = (float) T_cover * 1920.0f / 48000.0f;
+            if (rs < 0.0f) {
+                rs = 0.0f;
+            }
+            if (re < 0.0f) {
+                re = src_dur;
+            }
+            if (rs > src_dur) {
+                rs = src_dur;
+            }
+            if (re > src_dur) {
+                re = src_dur;
+            }
+            if (re > rs) {
+                is_repaint = true;
+                fprintf(stderr, "[Repaint] region: %.1fs - %.1fs (src=%.1fs)\n", rs, re, src_dur);
+            } else {
+                fprintf(stderr, "[Repaint] ERROR: repainting_end (%.1f) <= repainting_start (%.1f)\n", re, rs);
+                return 1;
+            }
+        }
+
         // 2. Build formatted prompts
         // Reference project uses opposite-sounding instructions (constants.py):
         //   text2music = "Fill the audio semantic mask..."
         //   cover      = "Generate audio semantic tokens..."
+        //   repaint    = "Repaint the mask area..."
         // Auto-switches to cover when audio_codes are present
         bool         is_cover    = have_cover || !codes_vec.empty();
-        const char * instruction = is_cover ? "Generate audio semantic tokens based on the given conditions:" :
-                                              "Fill the audio semantic mask based on the given conditions:";
+        const char * instruction = is_repaint ? "Repaint the mask area based on the given conditions:" :
+                                   is_cover   ? "Generate audio semantic tokens based on the given conditions:" :
+                                                "Fill the audio semantic mask based on the given conditions:";
         char         metas[512];
         snprintf(metas, sizeof(metas), "- bpm: %s\n- timesignature: %s\n- keyscale: %s\n- duration: %d seconds\n", bpm,
                  timesig, keyscale, (int) duration);
@@ -383,7 +417,7 @@ int main(int argc, char ** argv) {
             text_enc.use_flash_attn = false;
         }
         if (!qwen3_load_text_encoder(&text_enc, text_enc_gguf)) {
-            fprintf(stderr, "FATAL: failed to load text encoder\n");
+            fprintf(stderr, "[TextEncoder] FATAL: failed to load\n");
             dit_ggml_free(&model);
             if (have_vae) {
                 vae_ggml_free(&vae);
@@ -415,7 +449,7 @@ int main(int argc, char ** argv) {
             cond.use_flash_attn = false;
         }
         if (!cond_ggml_load(&cond, dit_gguf)) {
-            fprintf(stderr, "FATAL: failed to load condition encoder\n");
+            fprintf(stderr, "[CondEncoder] FATAL: failed to load\n");
             dit_ggml_free(&model);
             if (have_vae) {
                 vae_ggml_free(&vae);
@@ -447,7 +481,7 @@ int main(int argc, char ** argv) {
             timer.reset();
             DetokGGML detok = {};
             if (!detok_ggml_load(&detok, dit_gguf, model.backend, model.cpu_backend)) {
-                fprintf(stderr, "FATAL: failed to load detokenizer\n");
+                fprintf(stderr, "[Detokenizer] FATAL: failed to load\n");
                 dit_ggml_free(&model);
                 if (have_vae) {
                     vae_ggml_free(&vae);
@@ -466,7 +500,7 @@ int main(int argc, char ** argv) {
             timer.reset();
             int ret = detok_ggml_decode(&detok, codes_vec.data(), T_5Hz, decoded_latents.data());
             if (ret < 0) {
-                fprintf(stderr, "FATAL: detokenizer decode failed\n");
+                fprintf(stderr, "[Detokenizer] FATAL: decode failed\n");
                 dit_ggml_free(&model);
                 if (have_vae) {
                     vae_ggml_free(&vae);
@@ -480,19 +514,40 @@ int main(int argc, char ** argv) {
             detok_ggml_free(&detok);
         }
 
-        // Build context: [T, ctx_ch] = src_latents[64] + mask_ones[64]
-        // Cover: VAE latents directly (matching Python: is_covers=False, raw latents as context)
-        // Passthrough: detokenized FSQ codes + silence padding
-        // Text2music: silence only
+        // Build context: [T, ctx_ch] = src_latents[64] + chunk_mask[64]
+        // Cover:     src = cover_latents, mask = 1.0 everywhere
+        // Repaint:   src = silence in region / cover outside, mask = 1.0 in region / 0.0 outside
+        // Passthrough: detokenized FSQ codes + silence padding, mask = 1.0
+        // Text2music: silence only, mask = 1.0
+        int repaint_t0 = 0, repaint_t1 = 0;
+        if (is_repaint) {
+            repaint_t0 = (int) (rs * 48000.0f / 1920.0f);  // sec -> latent frames (25 Hz)
+            repaint_t1 = (int) (re * 48000.0f / 1920.0f);
+            if (repaint_t0 < 0) {
+                repaint_t0 = 0;
+            }
+            if (repaint_t1 > T) {
+                repaint_t1 = T;
+            }
+            if (repaint_t0 > T) {
+                repaint_t0 = T;
+            }
+            fprintf(stderr, "[Repaint] latent frames: [%d, %d) / %d\n", repaint_t0, repaint_t1, T);
+        }
         std::vector<float> context_single(T * ctx_ch);
         if (have_cover) {
             for (int t = 0; t < T; t++) {
-                const float * src = (t < T_cover) ? cover_latents.data() + t * Oc : silence_full.data() + t * Oc;
+                bool          in_region = is_repaint && t >= repaint_t0 && t < repaint_t1;
+                // src: silence in repaint region, cover_latents outside
+                const float * src       = in_region ?
+                                              silence_full.data() + t * Oc :
+                                              ((t < T_cover) ? cover_latents.data() + t * Oc : silence_full.data() + t * Oc);
+                float         mask_val  = is_repaint ? (in_region ? 1.0f : 0.0f) : 1.0f;
                 for (int c = 0; c < Oc; c++) {
                     context_single[t * ctx_ch + c] = src[c];
                 }
                 for (int c = 0; c < Oc; c++) {
-                    context_single[t * ctx_ch + Oc + c] = 1.0f;
+                    context_single[t * ctx_ch + Oc + c] = mask_val;
                 }
             }
         } else {
@@ -516,9 +571,10 @@ int main(int argc, char ** argv) {
 
         // Cover mode: build silence context for audio_cover_strength switching
         // When step >= cover_steps, DiT switches from cover context to silence context
+        // Repaint mode: mask handles region selection, no context switching needed
         std::vector<float> context_silence;
         int                cover_steps = -1;
-        if (have_cover) {
+        if (have_cover && !is_repaint) {
             float cover_strength = req.audio_cover_strength;
             if (cover_strength < 1.0f) {
                 // Build silence context: all frames use silence_latent
