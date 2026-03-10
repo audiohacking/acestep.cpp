@@ -265,26 +265,6 @@ The track name is passed on the CLI; set `audio_cover_strength=1.0` in the
 request so the source audio guides all DiT steps.
 See `examples/lego.json` and `examples/lego.sh`.
 
-```bash
-cat > /tmp/lego.json << 'EOF'
-{
-    "caption": "electric guitar riff, funk guitar, house music, instrumental",
-    "audio_cover_strength": 1.0,
-    "inference_steps": 50,
-    "guidance_scale": 7.0
-}
-EOF
-
-./build/dit-vae \
-    --src-audio backing-track.wav \
-    --lego guitar \
-    --request /tmp/lego.json \
-    --text-encoder models/Qwen3-Embedding-0.6B-Q8_0.gguf \
-    --dit models/acestep-v15-base-Q8_0.gguf \
-    --vae models/vae-BF16.gguf \
-    --wav
-```
-
 Available track names: `vocals`, `backing_vocals`, `drums`, `bass`, `guitar`,
 `keyboard`, `percussion`, `strings`, `synth`, `fx`, `brass`, `woodwinds`.
 
