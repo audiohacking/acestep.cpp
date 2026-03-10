@@ -1,0 +1,11 @@
+{
+    "caption": "electric guitar riff, funk guitar, house music, instrumental",
+    "lyrics": "[Instrumental]",
+    "bpm": 120,
+    "keyscale": "C major",
+    "timesignature": "4",
+    "inference_steps": 50,
+    "guidance_scale": 7.0,
+    "shift": 1.0,
+    "audio_cover_strength": 1.0
+}
