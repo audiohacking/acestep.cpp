@@ -269,7 +269,9 @@ See `examples/lego.json` and `examples/lego.sh`.
 cat > /tmp/lego.json << 'EOF'
 {
     "caption": "electric guitar riff, funk guitar, house music, instrumental",
-    "audio_cover_strength": 1.0
+    "audio_cover_strength": 1.0,
+    "inference_steps": 50,
+    "guidance_scale": 7.0
 }
 EOF
 
