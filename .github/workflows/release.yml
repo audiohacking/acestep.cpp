@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: 'Existing release tag to attach binaries to (e.g. v0.1.0)'
+        description: 'Release tag to attach binaries to (e.g. v0.1.0)'
         required: true
         type: string
 
@@ -47,8 +47,8 @@ jobs:
             os: macos-latest
 
           # ──────────── Windows ──────────────────────────────────────────
-          - name: windows-x64-cpu
-            os: windows-latest
+          # - name: windows-x64-cpu
+          #   os: windows-latest
 
           # CUDA 12.6.3 is pre-installed on windows-latest
           - name: windows-x64-cuda
