@@ -46,10 +46,6 @@ jobs:
           - name: macos-arm64-metal
             os: macos-latest
 
-          # macos-13 = x86_64 (Intel); Metal + Accelerate auto-enabled
-          - name: macos-x86_64-metal
-            os: macos-13
-
           # ──────────── Windows ──────────────────────────────────────────
           - name: windows-x64-cpu
             os: windows-latest
