@@ -1,0 +1,183 @@
+# Build and publish portable release binaries for every supported platform.
+# Runs automatically when a GitHub Release is published, and can also be
+# triggered manually via workflow_dispatch (provide the existing release tag).
+name: Release Binaries
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release tag to attach binaries to (e.g. v0.1.0)'
+        required: true
+        type: string
+
+# Allow uploading assets to releases
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build · ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # ──────────── Linux ────────────────────────────────────────────
+          - name: linux-x64-cpu-blas
+            os: ubuntu-22.04
+            cmake_flags: -DGGML_BLAS=ON
+            apt_extra: pkg-config libopenblas-dev
+
+          - name: linux-x64-cuda
+            os: ubuntu-22.04
+            cmake_flags: -DGGML_CUDA=ON
+            install_cuda: true
+
+          - name: linux-x64-vulkan
+            os: ubuntu-22.04
+            cmake_flags: -DGGML_VULKAN=ON
+            apt_extra: libvulkan-dev glslang-tools
+
+          # ──────────── macOS ────────────────────────────────────────────
+          # macos-latest = arm64 (M-series); Metal + Accelerate auto-enabled
+          - name: macos-arm64-metal
+            os: macos-latest
+
+          # ──────────── Windows ──────────────────────────────────────────
+          # - name: windows-x64-cpu
+          #   os: windows-latest
+
+          # CUDA 12.6.3 is pre-installed on windows-latest
+          - name: windows-x64-cuda
+            os: windows-latest
+            cmake_flags: -DGGML_CUDA=ON
+
+          - name: windows-x64-vulkan
+            os: windows-latest
+            cmake_flags: -DGGML_VULKAN=ON
+            install_vulkan_sdk: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # ── Linux: base build tools & optional apt packages ───────────────
+      - name: Install build tools (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq cmake build-essential ${{ matrix.apt_extra || '' }}
+
+      # ── Linux: CUDA toolkit from NVIDIA apt repository ────────────────
+      - name: Install CUDA toolkit (Linux)
+        if: matrix.install_cuda == true
+        run: |
+          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq cuda-toolkit-12-8
+          echo "/usr/local/cuda/bin" >> $GITHUB_PATH
+
+      # ── Windows: Vulkan SDK via Chocolatey ────────────────────────────
+      - name: Install Vulkan SDK (Windows)
+        if: matrix.install_vulkan_sdk == true
+        shell: pwsh
+        run: |
+          choco install vulkan-sdk --yes --no-progress
+          # Reload env so VULKAN_SDK is visible in subsequent steps
+          $sdkRoot = (Get-ChildItem 'C:\VulkanSDK' | Sort-Object Name | Select-Object -Last 1).FullName
+          "VULKAN_SDK=$sdkRoot" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "$sdkRoot\Bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+
+      # ── Configure & Build ─────────────────────────────────────────────
+      - name: Configure & Build (Linux / macOS)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir build && cd build
+          cmake .. ${{ matrix.cmake_flags || '' }}
+          CORES=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
+          cmake --build . --config Release -j"$CORES"
+
+      - name: Configure & Build (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path build | Out-Null
+          Set-Location build
+          cmake .. ${{ matrix.cmake_flags || '' }}
+          cmake --build . --config Release -j $env:NUMBER_OF_PROCESSORS
+
+      # ── Smoke test: verify binaries run (no GPU / model required) ─────
+      - name: Smoke test
+        shell: bash
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            BIN="build/Release"
+            EXT=".exe"
+          else
+            BIN="build"
+            EXT=""
+          fi
+          "$BIN/ace-qwen3$EXT"    --help 2>&1 | head -5
+          "$BIN/dit-vae$EXT"      --help 2>&1 | head -5
+          "$BIN/ace-understand$EXT" --help 2>&1 | head -5
+          "$BIN/neural-codec$EXT" --help 2>&1 | head -5
+          # quantize and mp3-codec print usage on bad args (exit 1 swallowed by pipe)
+          "$BIN/quantize$EXT"     --help 2>&1 | head -3
+          "$BIN/mp3-codec$EXT"    2>&1 | head -3
+
+      # ── Determine which release tag to upload to ──────────────────────
+      - name: Resolve release tag
+        id: tag
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            echo "value=${{ github.event.release.tag_name }}" >> $GITHUB_OUTPUT
+          else
+            echo "value=${{ inputs.release_tag }}" >> $GITHUB_OUTPUT
+          fi
+
+      # ── Package binaries ──────────────────────────────────────────────
+      - name: Package binaries (Linux / macOS)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p dist
+          cp build/ace-qwen3 build/dit-vae build/ace-understand \
+             build/quantize build/neural-codec build/mp3-codec dist/
+          tar -C dist -czf "acestep-${{ matrix.name }}.tar.gz" .
+
+      - name: Package binaries (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path dist | Out-Null
+          $bins = @('ace-qwen3','dit-vae','ace-understand','quantize','neural-codec','mp3-codec')
+          foreach ($b in $bins) {
+            Copy-Item "build\Release\$b.exe" dist\
+          }
+          Compress-Archive -Path dist\* -DestinationPath "acestep-${{ matrix.name }}.zip"
+
+      # ── Upload archive to the GitHub release ──────────────────────────
+      - name: Upload to release (Linux / macOS)
+        if: runner.os != 'Windows'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ steps.tag.outputs.value }}" \
+            "acestep-${{ matrix.name }}.tar.gz" \
+            --clobber
+
+      - name: Upload to release (Windows)
+        if: runner.os == 'Windows'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        run: |
+          gh release upload "${{ steps.tag.outputs.value }}" `
+            "acestep-${{ matrix.name }}.zip" `
+            --clobber
