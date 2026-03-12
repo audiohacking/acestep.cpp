@@ -37,13 +37,9 @@ jobs:
 
       - name: Smoke test
         run: |
-          ./build/ace-qwen3     --help 2>&1 | head -5
-          ./build/dit-vae       --help 2>&1 | head -5
-          ./build/ace-understand --help 2>&1 | head -5
-          ./build/neural-codec  --help 2>&1 | head -5
-          #./build/quantize      --help 2>&1 | head -3
-          #./build/mp3-codec            2>&1 | head -3
-
+          ./build/ace-qwen3 --help 2>&1 | head -5
+          ./build/dit-vae --help 2>&1 | head -5
+          ./build/quantize --help 2>&1 | head -3
   lint:
     name: Lint & Static Analysis
     runs-on: ubuntu-latest
