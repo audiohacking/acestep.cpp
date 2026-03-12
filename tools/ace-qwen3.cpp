@@ -931,7 +931,6 @@ int main(int argc, char ** argv) {
             char path[512];
             snprintf(path, sizeof(path), "%s%d%s", base.c_str(), b, ext.c_str());
             request_write(&rr, path);
-            fprintf(stderr, "[Output] Wrote %s\n", path);
         }
     }
 
