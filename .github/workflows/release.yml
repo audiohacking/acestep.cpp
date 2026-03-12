@@ -39,27 +39,12 @@ jobs:
           - name: linux-x64-vulkan
             os: ubuntu-22.04
             cmake_flags: -DGGML_VULKAN=ON
-            # apt_extra: libvulkan-dev glslang-tools
             install_vulkan: true
 
           # ──────────── macOS ────────────────────────────────────────────
           # macos-latest = arm64 (M-series); Metal + Accelerate auto-enabled
           - name: macos-arm64-metal
             os: macos-latest
-
-          # ──────────── Windows ──────────────────────────────────────────
-          # - name: windows-x64-cpu
-          #   os: windows-latest
-
-          # CUDA 12.6.3 is pre-installed on windows-latest
-          # - name: windows-x64-cuda
-          #  os: windows-latest
-          #  cmake_flags: -DGGML_CUDA=ON
-
-          # - name: windows-x64-vulkan
-          #  os: windows-latest
-          #  cmake_flags: -DGGML_VULKAN=ON
-          #  install_vulkan_sdk: true
 
     steps:
       - name: Checkout
@@ -74,26 +59,20 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq cmake build-essential ${{ matrix.apt_extra || '' }}
 
-      # ── Linux: CUDA toolkit from NVIDIA apt repository ────────────────
-      - uses: Jimver/cuda-toolkit@master
-        id: cuda-toolkit
-        with:
-          log-file-suffix: '${{matrix.os}}.txt'
-
+      # ── Linux: CUDA toolkit ────────────────
       - name: Install CUDA toolkit (Linux)
-        uses: Jimver/cuda-toolkit@master
+        uses: Jimver/cuda-toolkit@v0.2.30
         if: matrix.install_cuda == true
         with:
           log-file-suffix: '${{matrix.os}}.txt'
 
-      # ── Windows: Vulkan SDK via Chocolatey ────────────────────────────
+      # ── Linux: Vulkan SDK  ────────────────────────────
       - name: Install Vulkan SDK (Windows)
-        if: matrix.install_vulkan_sdk == true
-        uses: humbletim/setup-vulkan-sdk@v1.2.1
+        if: matrix.install_vulkan == true
+        uses: humbletim/install-vulkan-sdk@v1.2
         with:
-           vulkan-query-version: 1.4.304.1
-           vulkan-components: Vulkan-Headers, Vulkan-Loader
-           vulkan-use-cache: true
+          version: 1.4.309.0
+          cache: true
 
       # ── Configure & Build ─────────────────────────────────────────────
       - name: Configure & Build (Linux / macOS)
