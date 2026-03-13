@@ -159,12 +159,18 @@ static bool write_wav(const char * path, const float * audio, int T_audio, int s
     }
     float scale = peak > 0.0f ? 32767.0f / peak : 0.0f;
 
-    for (int t = 0; t < T_audio; t++) {
-        for (int c = 0; c < 2; c++) {
-            short v = (short) (audio[c * T_audio + t] * scale);
-            fwrite(&v, 2, 1, f);
-        }
+    // buffer all samples then write once (avoids millions of fwrite syscalls)
+    short * pcm = (short *) malloc((size_t) T_audio * 2 * sizeof(short));
+    if (!pcm) {
+        fclose(f);
+        return false;
     }
+    for (int t = 0; t < T_audio; t++) {
+        pcm[t * 2 + 0] = (short) (audio[0 * T_audio + t] * scale);
+        pcm[t * 2 + 1] = (short) (audio[1 * T_audio + t] * scale);
+    }
+    fwrite(pcm, 2, (size_t) T_audio * 2, f);
+    free(pcm);
     fclose(f);
     return true;
 }
