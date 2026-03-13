@@ -258,9 +258,14 @@ static bool audio_write_wav(const char * path, const float * audio, int T_audio,
     fwrite("data", 1, 4, f);
     fwrite(&data_size, 4, 1, f);
 
-    // write interleaved PCM16 from planar float
+    // buffer all samples then write once (avoids millions of fwrite syscalls)
     const float * L = audio;
     const float * R = audio + T_audio;
+    short * pcm = (short *) malloc((size_t) T_audio * 2 * sizeof(short));
+    if (!pcm) {
+        fclose(f);
+        return false;
+    }
     for (int t = 0; t < T_audio; t++) {
         float lf = L[t];
         float rf = R[t];
@@ -276,11 +281,11 @@ static bool audio_write_wav(const char * path, const float * audio, int T_audio,
         if (rf < -1.0f) {
             rf = -1.0f;
         }
-        short ls = (short) (lf * 32767.0f);
-        short rs = (short) (rf * 32767.0f);
-        fwrite(&ls, 2, 1, f);
-        fwrite(&rs, 2, 1, f);
+        pcm[t * 2 + 0] = (short) (lf * 32767.0f);
+        pcm[t * 2 + 1] = (short) (rf * 32767.0f);
     }
+    fwrite(pcm, 2, (size_t) T_audio * 2, f);
+    free(pcm);
 
     fclose(f);
     fprintf(stderr, "[WAV] wrote %s: %d samples, %d Hz, stereo\n", path, T_audio, sr);

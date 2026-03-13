@@ -487,7 +487,7 @@ static int mp3enc_outer_loop(const float *         xr,
     //   - stop when all bands are under threshold or no bits left
     //
     // Max 25 passes: enough for convergence at all bitrates.
-    float               noise[21];
+    float               noise[22];  // 22 SFB bands before table terminator
     int                 best_ix[576];
     mp3enc_granule_info best_gi    = gi;
     int                 best_total = gi.part2_3_length;
