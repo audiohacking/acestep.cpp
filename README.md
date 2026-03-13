@@ -22,13 +22,6 @@ cmake .. -DGGML_HIP=ON
 # Linux with Vulkan
 cmake .. -DGGML_VULKAN=ON
 
-# CPU with OpenBLAS (recommended for CPU-only machines)
-apt install pkg-config libopenblas-dev  # Debian/Ubuntu
-cmake .. -DGGML_BLAS=ON
-
-# Combine as needed
-cmake .. -DGGML_CUDA=ON -DGGML_BLAS=ON
-
 cmake --build . --config Release -j$(nproc)
 ```
 

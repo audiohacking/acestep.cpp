@@ -58,7 +58,23 @@ static BackendPair backend_init(const char * label) {
 
     ggml_backend_load_all();
     BackendPair bp = {};
-    bp.backend     = ggml_backend_init_best();
+
+    // GGML_BACKEND env var: force a specific device instead of auto-best.
+    // Device names: CUDA0, Vulkan0, CPU, BLAS (see ggml_backend_dev_name).
+    const char * force_backend = std::getenv("GGML_BACKEND");
+    if (force_backend) {
+        bp.backend = ggml_backend_init_by_name(force_backend, nullptr);
+        if (!bp.backend) {
+            fprintf(stderr, "[Load] FATAL: GGML_BACKEND=%s not found. Available:", force_backend);
+            for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+                fprintf(stderr, " %s", ggml_backend_dev_name(ggml_backend_dev_get(i)));
+            }
+            fprintf(stderr, "\n");
+            exit(1);
+        }
+    } else {
+        bp.backend = ggml_backend_init_best();
+    }
     if (!bp.backend) {
         fprintf(stderr, "[Load] FATAL: no backend available\n");
         exit(1);

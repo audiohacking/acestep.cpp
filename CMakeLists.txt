@@ -9,6 +9,11 @@ if(MSVC)
     add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
 endif()
 
+# Put executables and backend .so in the same directory (build root).
+# Without this, ggml defaults to bin/ for .so but executables stay in root,
+# and ggml_backend_load_all() can't find the backends at runtime.
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
+
 # DiT tensor names can exceed default GGML_MAX_NAME of 64
 add_compile_definitions(GGML_MAX_NAME=128)
 
@@ -48,9 +53,12 @@ macro(link_ggml_backends target)
     foreach(backend cpu blas cuda metal vulkan)
         if(TARGET ggml-${backend})
             get_target_property(CURRENT_BACKEND_TYPE ggml-${backend} TYPE)
-            if (NOT CURRENT_BACKEND_TYPE STREQUAL "MODULE_LIBRARY")
-                 target_link_libraries(${target} PRIVATE ggml-${backend})
+            if (CURRENT_BACKEND_TYPE STREQUAL "MODULE_LIBRARY")
+                # DL mode: backend is loaded at runtime via dlopen,
+                # skip all link-time deps and compile definitions.
+                continue()
             endif()
+            target_link_libraries(${target} PRIVATE ggml-${backend})
             string(TOUPPER ${backend} BACKEND_UPPER)
             target_compile_definitions(${target} PRIVATE ACESTEP_HAVE_${BACKEND_UPPER})
             if(backend STREQUAL "cuda")

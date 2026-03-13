@@ -1,5 +1,6 @@
 #!/bin/bash
-set -e
+
+set -eu
 
 Q="./build/quantize"
 
