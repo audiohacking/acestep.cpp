@@ -30,17 +30,9 @@ jobs:
             os: ubuntu-22.04
             cmake_flags: -DGGML_BLAS=ON
             apt_extra: pkg-config libopenblas-dev
-
-          - name: linux-x64-cuda
-            os: ubuntu-22.04
-            cmake_flags: -DGGML_CUDA=ON
             install_cuda: true
-
-          - name: linux-x64-vulkan
-            os: ubuntu-22.04
-            cmake_flags: -DGGML_VULKAN=ON
             install_vulkan: true
-
+            
           # ──────────── macOS ────────────────────────────────────────────
           # macos-latest = arm64 (M-series); Metal + Accelerate auto-enabled
           - name: macos-arm64-metal
@@ -76,12 +68,14 @@ jobs:
 
       # ── Configure & Build ─────────────────────────────────────────────
       - name: Configure & Build (Linux / macOS)
-        if: runner.os != 'Windows'
+        if: runner.os == 'Linux'
         run: |
-          mkdir build && cd build
-          cmake .. ${{ matrix.cmake_flags || '' }}
-          CORES=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
-          cmake --build . --config Release -j"$CORES"
+          ./buildall.sh
+          
+      - name: Configure & Build (Linux / macOS)
+        if: runner.os == 'Darwin'
+        run: |
+          ./builcpu.sh
 
       - name: Configure & Build (Windows)
         if: runner.os == 'Windows'
@@ -129,7 +123,7 @@ jobs:
         run: |
           mkdir -p dist
           cp build/ace-qwen3 build/dit-vae build/ace-understand \
-             build/quantize build/neural-codec build/mp3-codec dist/
+             build/quantize build/neural-codec build/mp3-codec build/*.so dist/
           tar -C dist -czf "acestep-${{ matrix.name }}.tar.gz" .
 
       - name: Package binaries (Windows)
