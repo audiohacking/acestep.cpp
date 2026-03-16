@@ -9,6 +9,21 @@ on:
         description: 'Release tag to attach binaries to (e.g. v0.1.0)'
         required: true
         type: string
+      skip_linux:
+        description: 'Skip Linux build'
+        required: false
+        type: boolean
+        default: false
+      skip_mac:
+        description: 'Skip macOS build'
+        required: false
+        type: boolean
+        default: false
+      skip_windows:
+        description: 'Skip Windows build'
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -17,6 +32,13 @@ jobs:
   build:
     name: Build · ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
+    if: >-
+      github.event_name != 'workflow_dispatch'
+      || (
+        (matrix.dispatch_skip_input != 'skip_linux'   || !fromJSON(inputs.skip_linux))
+        && (matrix.dispatch_skip_input != 'skip_mac'     || !fromJSON(inputs.skip_mac))
+        && (matrix.dispatch_skip_input != 'skip_windows' || !fromJSON(inputs.skip_windows))
+      )
     strategy:
       fail-fast: false
       matrix:
@@ -27,8 +49,15 @@ jobs:
             apt_extra: pkg-config libopenblas-dev
             install_cuda: true
             install_vulkan: true
+            dispatch_skip_input: skip_linux
           - name: macos-arm64-metal
             os: macos-latest
+            dispatch_skip_input: skip_mac
+          - name: windows-x64
+            os: windows-latest
+            install_cuda: true
+            install_vulkan: true
+            dispatch_skip_input: skip_windows
 
     steps:
       - name: Checkout
@@ -49,13 +78,13 @@ jobs:
           create-symlink: true
           key: ${{ github.job }}-${{ matrix.os }}
 
-      - name: Install CUDA toolkit (Linux)
+      - name: Install CUDA toolkit
         uses: Jimver/cuda-toolkit@v0.2.30
         if: matrix.install_cuda == true
         with:
           log-file-suffix: '${{matrix.os}}.txt'
 
-      - name: Install Vulkan SDK (Windows)
+      - name: Install Vulkan SDK
         if: matrix.install_vulkan == true
         uses: humbletim/install-vulkan-sdk@v1.2
         with:
