@@ -189,30 +189,58 @@ jobs:
         with:
           submodules: recursive
 
+      # Cache the CUDA toolkit installation (~5 GB, takes 20-30 min without cache)
+      - name: Cache CUDA toolkit
+        id: cache-cuda
+        uses: actions/cache@v4
+        with:
+          path: C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA
+          key: cuda-12-windows-latest
+
       - name: Install CUDA toolkit
+        if: steps.cache-cuda.outputs.cache-hit != 'true'
         uses: Jimver/cuda-toolkit@v0.2.30
         with:
           log-file-suffix: 'windows-latest.txt'
 
+      # Vulkan SDK has built-in cache support
       - name: Install Vulkan SDK
         uses: humbletim/install-vulkan-sdk@v1.2
         with:
           version: 1.4.309.0
           cache: true
 
+      # Cache the CMake build directory to speed up incremental builds
+      - name: Cache build directory
+        uses: actions/cache@v4
+        with:
+          path: build-msvc
+          key: build-msvc-${{ github.sha }}
+          restore-keys: |
+            build-msvc-
+
       - name: Configure & Build
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Path build | Out-Null
-          Set-Location build
-          cmake -S .. -B build-msvc -DGGML_CPU_ALL_VARIANTS=ON -DGGML_CUDA=ON -DGGML_VULKAN=ON -DGGML_BACKEND_DL=ON
-          cmake --build build-msvc --config Release -j $env:NUMBER_OF_PROCESSORS
+          # Configure — only print errors
+          cmake -S . -B build-msvc `
+            -DGGML_CPU_ALL_VARIANTS=ON `
+            -DGGML_CUDA=ON `
+            -DGGML_VULKAN=ON `
+            -DGGML_BACKEND_DL=ON `
+            --log-level=ERROR 2>&1 | Where-Object { $_ -notmatch '^--' }
+
+          # Build — suppress per-file progress, only show warnings/errors
+          cmake --build build-msvc --config Release -j $env:NUMBER_OF_PROCESSORS `
+            -- /v:minimal /consoleloggerparameters:ErrorsOnly 2>&1 `
+            | Where-Object { $_ -match '(error|warning|FAILED|fatal)' -or $_ -eq '' } `
+            | Select-Object -Last 50
 
       - name: Smoke test
         continue-on-error: true
         shell: bash
         run: |
-          BIN="build/Release"
+          BIN="build-msvc/Release"
           "$BIN/ace-lm.exe"         2>&1 | head -5
           "$BIN/ace-synth.exe"      2>&1 | head -5
           "$BIN/ace-understand.exe" 2>&1 | head -5
@@ -234,8 +262,8 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Path dist | Out-Null
-          Copy-Item "build\Release\*.exe" dist\ -ErrorAction SilentlyContinue
-          Copy-Item "build\Release\*.dll" dist\ -ErrorAction SilentlyContinue
+          Copy-Item "build-msvc\Release\*.exe" dist\ -ErrorAction SilentlyContinue
+          Copy-Item "build-msvc\Release\*.dll" dist\ -ErrorAction SilentlyContinue
           Compress-Archive -Path dist\* -DestinationPath "acestep-windows-x64.zip"
 
       - name: Upload to release
