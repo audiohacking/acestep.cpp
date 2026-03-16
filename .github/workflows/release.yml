@@ -32,13 +32,7 @@ jobs:
   build:
     name: Build · ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
-    if: >-
-      github.event_name != 'workflow_dispatch'
-      || (
-        (matrix.dispatch_skip_input != 'skip_linux'   || !fromJSON(inputs.skip_linux))
-        && (matrix.dispatch_skip_input != 'skip_mac'     || !fromJSON(inputs.skip_mac))
-        && (matrix.dispatch_skip_input != 'skip_windows' || !fromJSON(inputs.skip_windows))
-      )
+    if: ${{ !matrix.exclude }}
     strategy:
       fail-fast: false
       matrix:
@@ -49,15 +43,15 @@ jobs:
             apt_extra: pkg-config libopenblas-dev
             install_cuda: true
             install_vulkan: true
-            dispatch_skip_input: skip_linux
+            exclude: ${{ inputs.skip_linux || false }}
           - name: macos-arm64-metal
             os: macos-latest
-            dispatch_skip_input: skip_mac
+            exclude: ${{ inputs.skip_mac || false }}
           - name: windows-x64
             os: windows-latest
             install_cuda: true
             install_vulkan: true
-            dispatch_skip_input: skip_windows
+            exclude: ${{ inputs.skip_windows || false }}
 
     steps:
       - name: Checkout
