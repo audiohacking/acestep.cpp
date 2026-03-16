@@ -9,6 +9,21 @@ on:
         description: 'Release tag to attach binaries to (e.g. v0.1.0)'
         required: true
         type: string
+      skip_linux:
+        description: 'Skip Linux build'
+        required: false
+        type: boolean
+        default: false
+      skip_mac:
+        description: 'Skip macOS build'
+        required: false
+        type: boolean
+        default: false
+      skip_windows:
+        description: 'Skip Windows build'
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -17,6 +32,7 @@ jobs:
   build:
     name: Build · ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
+    if: ${{ !matrix.exclude }}
     strategy:
       fail-fast: false
       matrix:
@@ -27,8 +43,15 @@ jobs:
             apt_extra: pkg-config libopenblas-dev
             install_cuda: true
             install_vulkan: true
+            exclude: ${{ inputs.skip_linux || false }}
           - name: macos-arm64-metal
             os: macos-latest
+            exclude: ${{ inputs.skip_mac || false }}
+          - name: windows-x64
+            os: windows-latest
+            install_cuda: true
+            install_vulkan: true
+            exclude: ${{ inputs.skip_mac || false }}
 
     steps:
       - name: Checkout
@@ -49,13 +72,13 @@ jobs:
           create-symlink: true
           key: ${{ github.job }}-${{ matrix.os }}
 
-      - name: Install CUDA toolkit (Linux)
+      - name: Install CUDA toolkit
         uses: Jimver/cuda-toolkit@v0.2.30
         if: matrix.install_cuda == true
         with:
           log-file-suffix: '${{matrix.os}}.txt'
 
-      - name: Install Vulkan SDK (Windows)
+      - name: Install Vulkan SDK
         if: matrix.install_vulkan == true
         uses: humbletim/install-vulkan-sdk@v1.2
         with:
@@ -137,10 +160,8 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Path dist | Out-Null
-          $bins = @('ace-lm','ace-synth','ace-understand','quantize','neural-codec','mp3-codec')
-          foreach ($b in $bins) {
-            Copy-Item "build\Release\$b.exe" dist\
-          }
+          Copy-Item "build\Release\*.exe" dist\ -ErrorAction SilentlyContinue
+          Copy-Item "build\Release\*.dll" dist\ -ErrorAction SilentlyContinue
           Compress-Archive -Path dist\* -DestinationPath "acestep-${{ matrix.name }}.zip"
 
       - name: Upload to release (Linux / macOS)
