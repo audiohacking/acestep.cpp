@@ -56,6 +56,7 @@ static std::vector<float> parse_csv_float(const std::string & s) {
     const char *       last  = first + s.size();
     std::istringstream ss;
     ss.imbue(std::locale::classic());
+    std::string token;
     while (first < last) {
         while (first < last && (*first == ',' || *first == ' ')) {
             ++first;
@@ -68,10 +69,11 @@ static std::vector<float> parse_csv_float(const std::string & s) {
         while (token_end < last && *token_end != ',') {
             ++token_end;
         }
+        token.assign(first, token_end);
         ss.clear();
-        ss.str(std::string(first, token_end));
+        ss.str(token);
         float v{};
-        if (!(ss >> v)) {
+        if (!(ss >> v) || !ss.eof()) {
             break;
         }
         out.push_back(v);
