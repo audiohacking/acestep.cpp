@@ -193,10 +193,16 @@ Total LoRA params at r=8 on 24 layers ≈ 24 layers × 8 proj × (2048·8+8·204
 ### Phase plan
 
 - [x] **Phase 0 — study & feasibility** (this document)
-- [ ] **Phase 1 — safetensors writer + LoRA checkpoint round-trip**
-  Write adapter_model.safetensors from synthetic A/B tensors, reload via
-  adapter-merge, verify merged delta numerically. Small, de-risks the output
-  format first.
+- [x] **Phase 1 — safetensors writer + LoRA checkpoint round-trip**
+  `src/safetensors-write.h` (minimal writer, counterpart to the existing
+  reader) + `tests/test-lora-roundtrip.cpp`: generates synthetic LoRA A/B for
+  every self_attn/cross_attn q/k/v/o_proj tensor in a real DiT GGUF, writes a
+  PEFT adapter directory, runs it through the production `adapter_merge()`
+  path on the CPU backend, and checks the merged weights against a
+  host-computed reference. Verified against `acestep-v15-turbo-Q8_0.gguf`:
+  192/192 tensors (24 layers x 8 projections) merged, min cosine similarity
+  0.999982. Output format is confirmed byte-compatible with what
+  `src/adapter-merge.h` already loads for inference.
 - [ ] **Phase 2 — training graph + backward smoke test**
   DiT forward with LoRA branches on 1 tiny sample; build backward via
   ggml-opt; confirm no unsupported-op aborts (CPU first, then CUDA); confirm
@@ -232,14 +238,18 @@ Total LoRA params at r=8 on 24 layers ≈ 24 layers × 8 proj × (2048·8+8·204
   Audited GGML fork autograd/opt coverage against the DiT graph op
   inventory — **no fork changes required to start**. Branch `training`
   created, plan written.
+- 2026-07-23: Phase 1 complete. safetensors writer + round-trip test added
+  and passing against the real turbo DiT GGUF (see Phase 1 above). Next up:
+  Phase 2, the training graph + backward smoke test.
 
 ## Verification checklist (running)
 
+- [x] Saved safetensors loads via adapter-merge with correct alpha/rank scaling
+      (`tests/test-lora-roundtrip.cpp`, 192/192 tensors, cossim 0.999982)
 - [ ] Backward graph builds without abort for full 24-layer DiT (CPU)
 - [ ] Same on CUDA; scheduler places OUT_PROD/OPT_STEP_ADAMW correctly
 - [ ] soft_max_ext backward correct with attention mask input
 - [ ] LoRA A/B grads nonzero after 1 step; frozen weights bit-identical
 - [ ] Overfit single sample: loss → ~0
-- [ ] Saved safetensors loads via adapter-merge with correct alpha/rank scaling
 - [ ] prepare-stage tensors match Python preprocessed .pt (cossim) on one sample
 - [ ] Trained LoRA audibly shifts style in ace-synth output

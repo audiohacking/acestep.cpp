@@ -15,3 +15,9 @@ link_ggml_backends(test-model-store)
 add_executable(test-lm-prompt test-lm-prompt.cpp)
 target_link_libraries(test-lm-prompt PRIVATE acestep-core)
 link_ggml_backends(test-lm-prompt)
+
+# test-lora-roundtrip: safetensors writer + adapter-merge LoRA round-trip
+# (Phase 1 of native LoRA training, see ../TRAINING_DEV.md).
+add_executable(test-lora-roundtrip test-lora-roundtrip.cpp)
+target_link_libraries(test-lora-roundtrip PRIVATE acestep-core)
+link_ggml_backends(test-lora-roundtrip)
