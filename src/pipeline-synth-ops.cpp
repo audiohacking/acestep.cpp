@@ -6,6 +6,7 @@
 
 #include "pipeline-synth-ops.h"
 
+#include "dit-prompt.h"
 #include "dit-sampler.h"
 #include "philox.h"
 #include "pipeline-synth-impl.h"
@@ -408,20 +409,8 @@ static void build_prompt_strings(const AceRequest &  rb,
                                  float               duration,
                                  std::string &       text_out,
                                  std::string &       lyric_out) {
-    char bpm_b[16] = "N/A";
-    if (rb.bpm > 0) {
-        snprintf(bpm_b, sizeof(bpm_b), "%d", rb.bpm);
-    }
-    const char * keyscale_b = rb.keyscale.empty() ? "N/A" : rb.keyscale.c_str();
-    const char * timesig_b  = rb.timesignature.empty() ? "N/A" : rb.timesignature.c_str();
-    const char * language_b = rb.vocal_language.empty() ? "unknown" : rb.vocal_language.c_str();
-
-    char metas_b[512];
-    snprintf(metas_b, sizeof(metas_b), "- bpm: %s\n- timesignature: %s\n- keyscale: %s\n- duration: %d seconds\n",
-             bpm_b, timesig_b, keyscale_b, (int) duration);
-    text_out = std::string("# Instruction\n") + instruction + "\n\n" + "# Caption\n" + rb.caption + "\n\n" +
-               "# Metas\n" + metas_b + "<|endoftext|>\n";
-    lyric_out = std::string("# Languages\n") + language_b + "\n\n# Lyric\n" + rb.lyrics + "<|endoftext|>";
+    dit_build_prompt_strings(instruction, rb.caption, rb.lyrics, rb.bpm, rb.keyscale, rb.timesignature,
+                             rb.vocal_language, duration, text_out, lyric_out);
 }
 
 int ops_encode_text(const AceSynth * ctx, const AceRequest * reqs, int batch_n, SynthState & s) {

@@ -123,17 +123,17 @@ The GGML fork already contains everything needed to train:
 ## Design
 
 `ace-train` (`tools/ace-train.cpp`), two subcommands sharing the models
-dir. `fit` is implemented (Phase 3); `prepare` is a stub that reports
-"not yet, see Phase 4" (it doesn't exist yet):
+dir. Both implemented (Phase 3: `fit`, Phase 4: `prepare`):
 
 ```
-# 1) Dataset preparation: decorate + encode -- PLANNED, not implemented (Phase 4)
+# 1) Dataset preparation: decorate + encode
 ./ace-train prepare \
     --models models \
     --dataset  path/to/audio_dir \        # .wav/.mp3 (+optional sidecars)
-    --output   path/to/tensors_dir        # per-sample GGUF
+    --output   path/to/tensors_dir \      # per-sample GGUF
+    --lm-model acestep-5Hz-lm-4B-Q8_0.gguf  # optional, auto-labels missing captions
 
-# 2) Training -- IMPLEMENTED
+# 2) Training
 ./ace-train fit \
     --models   models \
     --tensors  path/to/tensors_dir \
@@ -142,29 +142,37 @@ dir. `fit` is implemented (Phase 3); `prepare` is a stub that reports
     --save-every 10 --seed 42 [--val-split 0.1]
 ```
 
-Until `prepare` exists, build the tensor cache by hand with
-`dit_train_sample_write()` (`src/dit-train-data.h`) — see
-`tests/gen-train-samples.cpp` for the shapes/conventions `fit` expects.
+### prepare stage (implemented, Phase 4)
 
-### prepare stage (planned, Phase 4)
-
-Per audio file in `--dataset`:
+Per audio file in `--dataset` (`src/dit-prepare.h`):
 1. Sidecar discovery (Python-compatible): `{name}.lyrics.txt`/`{name}.txt`
-   (lyrics), `{name}.json` (caption/bpm/keyscale/timesignature/language),
-   `{name}.caption.txt`.
-2. Missing metadata → **understand pipeline** (`pipeline-understand`) fills
-   caption, lyrics, bpm, keyscale, duration, language. This is the
-   "Auto Label" step, native.
-3. Encode (all existing modules): audio → 48kHz stereo → VAE encode →
-   `target_latents`; build SFT prompt → BPE → Qwen3 encoder → text_hs;
-   lyrics → BPE → embed_tokens → lyric_hs; CondEncoder(text, lyric,
-   timbre=zeros) → `encoder_hidden_states`; `context_latents` =
-   concat(silence_latent[:T], ones).
+   (lyrics), `{name}.json` (caption/bpm/keyscale/timesignature/language/
+   is_instrumental), `{name}.caption.txt`. Only `.wav`/`.mp3` audio is
+   decodable today (what `src/audio-io.h` implements); `.flac`/`.ogg`/
+   `.opus` files are reported and skipped.
+2. Missing caption → **understand pipeline** (`pipeline-understand`) fills
+   caption, lyrics, bpm, keyscale, language. This is the "Auto Label" step,
+   native, and does not overwrite fields the sidecars already provided.
+   Duration always comes from the real decoded audio length, never from
+   the LM (matching the dataset builder's own "duration is auto-read, not
+   LM-guessed" treatment).
+3. Encode (all existing inference modules, reused as-is — see the
+   Decisions log for the two conditioning conventions this deliberately
+   does NOT copy from the Python trainer): audio → 48kHz stereo → tiled
+   VAE encode → `target_latents`; `src/dit-prompt.h` builds the SFT prompt
+   and the language-wrapped lyric prompt (byte-identical to what
+   ace-synth builds for the same inputs) → BPE → Qwen3 encoder (text) /
+   embed_tokens (lyrics); CondEncoder(text, lyric, timbre=one silence_latent
+   frame) → `encoder_hidden_states`; `context_latents` =
+   concat(silence_latent[:T], ones); T is rounded up to a `patch_size`
+   multiple (silence-padded) exactly like `ops_resolve_T` does for
+   `--src-audio` at inference time.
 4. Write one GGUF per sample (`{name}.gguf`) via
    `dit_train_sample_write()` — same 3-tensor format `fit` already
    consumes (`target_latents`, `context_latents`, `encoder_hidden`, each
-   unpadded at that sample's exact length; see the decision below on why
-   there's no separate attention_mask tensor).
+   unpadded — beyond the patch_size rounding above — at that sample's
+   exact length; see the decision below on why there's no separate
+   attention_mask tensor).
 
 GGUF as tensor cache = zero new formats, existing reader infra, easy to
 inspect with existing tooling.
@@ -283,9 +291,31 @@ zeroes the accumulator. Cheap regardless of `grad_accum`: the graph is
   fixed during this phase (both in `dit_train_sample_write`/the ctx-memory
   budget it uses, and the usage-string program-name bug in `ace-train.cpp`)
   — see Decisions log.
-- [ ] **Phase 4 — `ace-train prepare`**
-  Sidecar scan + understand decoration + tensor GGUF cache. (After fit so
-  early fit testing can use hand-built tensors from the existing pipelines.)
+- [x] **Phase 4 — `ace-train prepare`**
+  `src/dit-prepare.h` (sidecar scan, auto-label via the understand pipeline,
+  audio -> VAE/text/lyric/cond encode) + `src/dit-prompt.h` (the DiT
+  text/lyric prompt builder, extracted out of `pipeline-synth-ops.cpp` so
+  inference and dataset prep can never drift apart — see Decisions log for
+  why this matters). Sidecar schema matches the Python trainer exactly
+  (`{name}.json`, `{name}.lyrics.txt`/`.txt`, `{name}.caption.txt`); audio
+  decoding is limited to .wav/.mp3 (what `src/audio-io.h` implements today —
+  .flac/.ogg/.opus sidecars are reported and skipped, not silently dropped).
+  **Validated end to end** against real music files (a mix of tracks with
+  full sidecars and one with none, to exercise auto-labeling) from a local
+  `/tmp/music` sample library: `ace-train prepare` encoded all samples with
+  no failures (including successfully auto-labeling the sidecar-less file
+  via the LM, hallucinated caption content and all — a known, expected LM
+  behavior, not a pipeline bug), `ace-train fit` trained on the resulting
+  tensor cache with a real train/val split, and the resulting checkpoint
+  loaded through the *production* `ace-synth --adapters` path — 192/192
+  tensors merged, 0 skipped — for both a single-sample and a 3-sample real
+  batch. One real bug found and fixed: VAE-encoded `T` isn't guaranteed to
+  be a multiple of `patch_size` (a 4.47s clip encoded to T=111, odd); the
+  DiT's patchify reshape requires `T % patch_size == 0` and aborted
+  (`ggml_reshape_3d` assert) on the unpadded sample. Fixed by rounding T up
+  and padding the tail with `silence_latent` frames, exactly mirroring how
+  `ops_resolve_T` already does this for `--src-audio` at inference time
+  (`src/pipeline-synth-ops.cpp:330`).
 - [ ] **Phase 5 — end-to-end validation**
   Train a small-style LoRA on 10–20 songs; A/B the adapter in ace-synth /
   WebUI vs base model; compare loss curves against the Python trainer on the
@@ -363,6 +393,52 @@ zeroes the accumulator. Cheap regardless of `grad_accum`: the graph is
   `argv[0]` (i.e. the first *flag*, not the program name) in its own usage
   string. Fixed by passing the real `argv[0]` through explicitly from
   `main()`.
+- 2026-07-23: **Phase 4 conditioning-convention decisions.** While
+  implementing `dit_prepare_encode_sample`, found that
+  `acestep-repo/acestep/training/dataset_builder_modules` (the Python LoRA
+  trainer's own dataset prep) uses different conditioning conventions than
+  the original ACE-Step inference pipeline in two places:
+  - **Lyrics**: the Python trainer's `preprocess_lyrics.py` tokenizes raw,
+    unwrapped lyrics text. Both the original Python inference pipeline
+    (`acestep-repo/.../prompt_utils.py::_format_lyrics`) and ace-synth
+    (`build_prompt_strings`) wrap lyrics as
+    `"# Languages\n{lang}\n\n# Lyric\n{lyrics}<|endoftext|>"` first.
+  - **Timbre placeholder**: the Python trainer passes `zeros(1, 1, 64)`
+    to the CondEncoder's timbre branch when there's no reference audio
+    (`preprocess_encoder.py::run_encoder`). ace-synth instead passes one
+    frame of the DiT's own `silence_latent` (`ctx->meta->silence_full`,
+    `src/pipeline-synth-ops.cpp:369/381/390`) — a real learned VAE
+    encoding of silence, not literal zeros.
+  User confirmed (asked directly, see conversation): match ace-synth's own
+  conventions for both, not the Python trainer's. Rationale, stated by the
+  user and consistent throughout: a LoRA trained here is used *through
+  ace-synth*, so it must see exactly the conditioning distribution
+  ace-synth actually produces at inference time; bit-for-bit fidelity to
+  the community trainer's dataset code is secondary to that. Implemented
+  in `src/dit-prompt.h` (extracted out of `pipeline-synth-ops.cpp` as a
+  shared function — `dit_build_prompt_strings` — specifically so inference
+  and `ace-train prepare` can never drift apart on this again) and
+  `dit_prepare_encode_sample`'s CondEncoder call (`meta->silence_full`,
+  1 frame, `S_ref=1`).
+  The **context_latents src channels** (text2music: silence + mask=1) do
+  *not* have this conflict — both the Python trainer
+  (`preprocess_context.py::build_context_latents`) and ace-synth already
+  use the real `silence_latent`, not zeros. (Earlier Phase 2/3 test code —
+  `tests/gen-train-samples.cpp`, `tests/test-lora-train-smoke.cpp` — used
+  literal zeros there, which was fine for those phases' mechanism-only
+  smoke tests but is *not* what `dit_prepare_encode_sample` does for real
+  data; it correctly uses `silence_full`.)
+- 2026-07-23: found and fixed a real bug via the real-audio end-to-end
+  test: VAE-encoded `T` (latent frame count) is not guaranteed to be a
+  multiple of the DiT's `patch_size` — a 4.47s clip encoded to T=111
+  (odd). `dit_ggml_build_graph`'s patchify reshape requires
+  `T % patch_size == 0` and aborted with a `ggml_reshape_3d` assertion on
+  the unpadded sample. ace-synth already handles this for `--src-audio`
+  inputs by rounding `T` up to the next multiple of `patch_size`
+  (`ops_resolve_T`, `src/pipeline-synth-ops.cpp:330`); `dit_prepare_encode_sample`
+  now does the same, padding both `target_latents` and (implicitly, via
+  the later loop) `context_latents` with `silence_latent` frames for the
+  tail.
 
 ## Progress log
 
@@ -389,6 +465,22 @@ zeroes the accumulator. Cheap regardless of `grad_accum`: the graph is
   Next up: Phase 4, `ace-train prepare` (real dataset decoration via the
   understand pipeline + VAE/text/cond encoding, replacing the synthetic
   generator).
+- 2026-07-23: Phase 4 complete. `ace-train prepare` implemented
+  (`src/dit-prepare.h`) and validated against real music files (mixed
+  sidecar-complete and sidecar-less, from a local `/tmp/music` library):
+  sidecar scan + auto-label + VAE/text/lyric/cond encode all working, one
+  real bug found and fixed (VAE-encoded T not always a multiple of
+  patch_size — see Decisions log), and the full `prepare` -> `fit` ->
+  `ace-synth --adapters` chain validated end to end on real audio
+  (192/192 tensors merged, 0 skipped, both single-sample and 3-sample
+  batches). Two deliberate conditioning-convention departures from the
+  Python trainer's dataset builder (lyric wrapper, timbre placeholder),
+  confirmed with the user and documented in the Decisions log, along with
+  the shared `src/dit-prompt.h` extraction that keeps inference and
+  training conditioning from ever drifting apart. Next up: Phase 5,
+  end-to-end validation (train a real style LoRA on 10-20 songs, A/B
+  against the base model, compare against the Python trainer on the same
+  dataset).
 
 ## Verification checklist (running)
 
@@ -407,14 +499,25 @@ zeroes the accumulator. Cheap regardless of `grad_accum`: the graph is
 - [x] `ace-train fit`'s checkpoint output loads through the *production*
       `ace-synth --adapters` path (192/192 tensors merged, 0 skipped) and
       renders audio
+- [x] `ace-train prepare` encodes real audio (.mp3) end to end: sidecar
+      scan, auto-label via understand when captions are missing, VAE/text/
+      lyric/cond encode, T-padding to a patch_size multiple, all with no
+      crash or FATAL, on a mixed batch of sidecar-complete and
+      sidecar-less real files
+- [x] `ace-train prepare` -> `fit` -> `ace-synth --adapters` full chain
+      validated on real audio (192/192 tensors merged, 0 skipped, single-
+      sample and 3-sample batches)
 - [ ] Same backward graph verified on CPU backend specifically
 - [ ] soft_max_ext backward correct with a *non-trivial* attention mask
-      (smoke test and fit loop both use all-valid masks so far; real
-      padding never exercised, though the current design avoids padding
-      by training each sample at its own exact length)
-- [ ] VRAM measured at production T (~2000+ latent frames); Phase 3's
-      end-to-end run used small synthetic T (16-48) to iterate quickly
-- [ ] prepare-stage tensors match Python preprocessed .pt (cossim) on one
-      sample (blocked on Phase 4)
-- [ ] Trained LoRA audibly shifts style in ace-synth output (needs a real
-      dataset + Phase 4, not just the synthetic-data smoke test)
+      (real prepared samples still use all-valid masks: each sample is
+      encoded and trained at its own exact — now patch-padded — length,
+      never batched with others, so there's no padding-driven masking to
+      exercise yet)
+- [ ] VRAM measured at production-length songs (full 3-6 minute tracks;
+      testing so far used short clips for iteration speed)
+- [ ] prepare-stage tensors match Python preprocessed .pt (cossim) on the
+      same real sample (would need a working acestep-megalora preprocess
+      run to compare against — not yet done)
+- [ ] Trained LoRA audibly shifts style in ace-synth output on a real
+      multi-song style dataset (Phase 5: today's real-audio runs used 1-3
+      songs purely to validate the pipeline mechanics, not style transfer)

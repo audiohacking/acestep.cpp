@@ -1,17 +1,19 @@
-// ace-train.cpp: native LoRA training for the ACE-Step DiT (Phase 3, see
-// ../TRAINING_DEV.md). Two subcommands:
+// ace-train.cpp: native LoRA training for the ACE-Step DiT (Phases 3 + 4,
+// see ../TRAINING_DEV.md). Two subcommands:
 //
 //   ace-train fit     --models <dir> --tensors <dir> --output <dir> [...]
 //   ace-train prepare --models <dir> --dataset <dir> --output <dir> [...]
 //
 // `fit` trains LoRA adapters from a directory of preprocessed per-sample
-// tensor GGUFs (src/dit-train-data.h). `prepare` (dataset decoration via the
-// understand pipeline + VAE/text/cond encoding) is Phase 4 and not yet
-// implemented -- this binary reports that clearly rather than guessing.
+// tensor GGUFs (src/dit-train-data.h). `prepare` scans a directory of audio
+// files + sidecar labels, auto-labels missing captions via the understand
+// pipeline, and encodes each into that tensor cache (src/dit-prepare.h).
 
+#include "dit-prepare.h"
 #include "dit-train-data.h"
 #include "dit-train.h"
 #include "model-registry.h"
+#include "model-store.h"
 #include "version.h"
 
 #include <algorithm>
@@ -19,8 +21,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <random>
 #include <string>
+#include <system_error>
 #include <vector>
 
 struct FitArgs {
@@ -308,13 +312,194 @@ static int run_fit(const char * prog, int argc, char ** argv) {
     return 0;
 }
 
-static int run_prepare(int /*argc*/, char ** /*argv*/) {
+struct PrepareArgs {
+    std::string models_dir;
+    std::string dataset_dir;
+    std::string output_dir;
+    std::string dit_model;
+    std::string text_enc_model;
+    std::string vae_model;
+    std::string lm_model;   // optional, enables auto-labeling missing captions
+    float       max_duration  = 240.0f;
+    int         vae_chunk     = 1024;
+    int         vae_overlap   = 64;
+    bool        skip_existing = false;
+};
+
+static void usage_prepare(const char * prog) {
     fprintf(stderr,
-            "[ace-train] 'prepare' is not implemented yet (Phase 4, see TRAINING_DEV.md).\n"
-            "Build the tensor cache by hand for now: src/dit-train-data.h exposes\n"
-            "dit_train_sample_write() for that (see tests/test-lora-train-smoke.cpp for\n"
-            "the tensor shapes/conventions expected by 'ace-train fit').\n");
-    return 1;
+            "acestep.cpp %s\n\n"
+            "Usage: %s prepare --models <dir> --dataset <dir> --output <dir> [options]\n"
+            "\n"
+            "Required:\n"
+            "  --models <dir>          Directory of GGUF model files (needs DiT, Text-Enc, VAE)\n"
+            "  --dataset <dir>         Directory of audio files + sidecar labels\n"
+            "                          ({name}.json, {name}.lyrics.txt/.txt, {name}.caption.txt)\n"
+            "  --output <dir>          Where to write sample tensor GGUFs\n"
+            "\n"
+            "Auto-labeling:\n"
+            "  --lm-model <name>       LM GGUF filename; fills captions missing from sidecars\n"
+            "                          (samples with no caption and no --lm-model are skipped)\n"
+            "\n"
+            "Options:\n"
+            "  --dit-model <name>      DiT GGUF filename (default: first DiT found)\n"
+            "  --text-enc-model <name> Text encoder GGUF filename (default: first found)\n"
+            "  --vae-model <name>      VAE GGUF filename (default: first found)\n"
+            "  --max-duration <F>      Truncate audio to this many seconds (default: 240)\n"
+            "  --vae-chunk <N>         Latent frames per VAE tile (default: 1024)\n"
+            "  --vae-overlap <N>       Overlap frames per side (default: 64)\n"
+            "  --skip-existing         Skip samples whose output file already exists\n",
+            ACE_VERSION, prog);
+}
+
+static int run_prepare(const char * prog, int argc, char ** argv) {
+    PrepareArgs a;
+    for (int i = 0; i < argc; i++) {
+        std::string arg  = argv[i];
+        auto        need = [&](const char * name) -> const char * {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "[ace-train] FATAL: %s needs a value\n", name);
+                exit(1);
+            }
+            return argv[++i];
+        };
+        if (arg == "--models") {
+            a.models_dir = need("--models");
+        } else if (arg == "--dataset") {
+            a.dataset_dir = need("--dataset");
+        } else if (arg == "--output") {
+            a.output_dir = need("--output");
+        } else if (arg == "--dit-model") {
+            a.dit_model = need("--dit-model");
+        } else if (arg == "--text-enc-model") {
+            a.text_enc_model = need("--text-enc-model");
+        } else if (arg == "--vae-model") {
+            a.vae_model = need("--vae-model");
+        } else if (arg == "--lm-model") {
+            a.lm_model = need("--lm-model");
+        } else if (arg == "--max-duration") {
+            a.max_duration = (float) atof(need("--max-duration"));
+        } else if (arg == "--vae-chunk") {
+            a.vae_chunk = atoi(need("--vae-chunk"));
+        } else if (arg == "--vae-overlap") {
+            a.vae_overlap = atoi(need("--vae-overlap"));
+        } else if (arg == "--skip-existing") {
+            a.skip_existing = true;
+        } else if (arg == "-h" || arg == "--help") {
+            usage_prepare(prog);
+            return 0;
+        } else {
+            fprintf(stderr, "[ace-train] FATAL: unknown argument '%s'\n", arg.c_str());
+            usage_prepare(prog);
+            return 1;
+        }
+    }
+
+    if (a.models_dir.empty() || a.dataset_dir.empty() || a.output_dir.empty()) {
+        fprintf(stderr, "[ace-train] FATAL: --models, --dataset and --output are all required\n");
+        usage_prepare(prog);
+        return 1;
+    }
+
+    ModelRegistry reg;
+    if (!registry_scan(&reg, a.models_dir.c_str())) {
+        fprintf(stderr, "[ace-train] FATAL: no models found in %s\n", a.models_dir.c_str());
+        return 1;
+    }
+
+    auto resolve = [&](const std::vector<ModelEntry> & bucket, const std::string & override_name,
+                       const char * kind) -> std::string {
+        if (!override_name.empty()) {
+            const ModelEntry * e = registry_find(bucket, override_name.c_str());
+            if (!e) {
+                fprintf(stderr, "[ace-train] FATAL: %s model '%s' not found in %s\n", kind, override_name.c_str(),
+                        a.models_dir.c_str());
+                exit(1);
+            }
+            return e->path;
+        }
+        if (bucket.empty()) {
+            fprintf(stderr, "[ace-train] FATAL: no %s model found in %s\n", kind, a.models_dir.c_str());
+            exit(1);
+        }
+        return bucket[0].path;
+    };
+
+    DiTPrepareParams params;
+    params.dit_path      = resolve(reg.dit, a.dit_model, "DiT");
+    params.text_enc_path = resolve(reg.text_enc, a.text_enc_model, "Text-Enc");
+    params.vae_path       = resolve(reg.vae, a.vae_model, "VAE");
+    params.vae_chunk      = a.vae_chunk;
+    params.vae_overlap    = a.vae_overlap;
+    params.max_duration   = a.max_duration;
+
+    std::string lm_path;
+    if (!a.lm_model.empty()) {
+        const ModelEntry * e = registry_find(reg.lm, a.lm_model.c_str());
+        if (!e) {
+            fprintf(stderr, "[ace-train] FATAL: LM model '%s' not found in %s\n", a.lm_model.c_str(),
+                    a.models_dir.c_str());
+            return 1;
+        }
+        lm_path = e->path;
+    } else if (!reg.lm.empty()) {
+        lm_path = reg.lm[0].path;
+    }
+    fprintf(stderr, "[ace-train] DiT: %s\n", params.dit_path.c_str());
+    fprintf(stderr, "[ace-train] Text-Enc: %s\n", params.text_enc_path.c_str());
+    fprintf(stderr, "[ace-train] VAE: %s\n", params.vae_path.c_str());
+    fprintf(stderr, "[ace-train] Auto-label LM: %s\n", lm_path.empty() ? "(none -- captions must come from sidecars)"
+                                                                      : lm_path.c_str());
+
+    std::vector<DiTPrepareLabel> labels = dit_prepare_scan_dataset(a.dataset_dir);
+    if (labels.empty()) {
+        fprintf(stderr, "[ace-train] FATAL: no .wav/.mp3 files found in %s\n", a.dataset_dir.c_str());
+        return 1;
+    }
+    fprintf(stderr, "[ace-train] Found %zu audio files in %s\n", labels.size(), a.dataset_dir.c_str());
+
+    std::error_code ec;
+    std::filesystem::create_directories(a.output_dir, ec);
+
+    // EVICT_NEVER: VAE-Enc, Text-Enc and Cond-Enc are all small and used on
+    // every sample. Under EVICT_STRICT each require() would evict the other
+    // two, forcing a full reload per sample per module -- pure overhead for
+    // a batch tool with no VRAM pressure between these three.
+    ModelStore * store = store_create(EVICT_NEVER);
+
+    int n_ok = 0, n_skip = 0, n_fail = 0;
+    for (size_t i = 0; i < labels.size(); i++) {
+        DiTPrepareLabel & label       = labels[i];
+        std::string        out_path   = a.output_dir + "/" + label.stem + ".gguf";
+
+        if (a.skip_existing && registry_is_file(out_path.c_str())) {
+            fprintf(stderr, "[ace-train] [%zu/%zu] Skipping %s (exists)\n", i + 1, labels.size(), label.stem.c_str());
+            n_skip++;
+            continue;
+        }
+
+        fprintf(stderr, "[ace-train] [%zu/%zu] Encoding %s\n", i + 1, labels.size(), label.stem.c_str());
+
+        DiTTrainSample sample;
+        if (!dit_prepare_encode_sample(store, params, label, lm_path.empty() ? nullptr : lm_path.c_str(), &sample)) {
+            fprintf(stderr, "[ace-train] FAILED: %s\n", label.stem.c_str());
+            n_fail++;
+            continue;
+        }
+
+        if (!dit_train_sample_write(sample, out_path)) {
+            fprintf(stderr, "[ace-train] FAILED to write: %s\n", out_path.c_str());
+            n_fail++;
+            continue;
+        }
+        n_ok++;
+    }
+
+    store_free(store);
+
+    fprintf(stderr, "[ace-train] Done: %d encoded, %d skipped, %d failed (of %zu)\n", n_ok, n_skip, n_fail,
+            labels.size());
+    return (n_fail > 0 && n_ok == 0) ? 1 : 0;
 }
 
 int main(int argc, char ** argv) {
@@ -327,7 +512,7 @@ int main(int argc, char ** argv) {
         return run_fit(argv[0], argc - 2, argv + 2);
     }
     if (cmd == "prepare") {
-        return run_prepare(argc - 2, argv + 2);
+        return run_prepare(argv[0], argc - 2, argv + 2);
     }
     fprintf(stderr, "[ace-train] FATAL: unknown subcommand '%s' (expected 'fit' or 'prepare')\n", cmd.c_str());
     return 1;
