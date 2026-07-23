@@ -122,17 +122,18 @@ The GGML fork already contains everything needed to train:
 
 ## Design
 
-New binary: **`ace-train`** (tools/ace-train.cpp), two subcommands sharing
-the models dir and ModelStore infra:
+`ace-train` (`tools/ace-train.cpp`), two subcommands sharing the models
+dir. `fit` is implemented (Phase 3); `prepare` is a stub that reports
+"not yet, see Phase 4" (it doesn't exist yet):
 
 ```
-# 1) Dataset preparation: decorate + encode
+# 1) Dataset preparation: decorate + encode -- PLANNED, not implemented (Phase 4)
 ./ace-train prepare \
     --models models \
     --dataset  path/to/audio_dir \        # .wav/.mp3 (+optional sidecars)
-    --output   path/to/tensors_dir        # per-sample GGUF + manifest.json
+    --output   path/to/tensors_dir        # per-sample GGUF
 
-# 2) Training
+# 2) Training -- IMPLEMENTED
 ./ace-train fit \
     --models   models \
     --tensors  path/to/tensors_dir \
@@ -141,7 +142,11 @@ the models dir and ModelStore infra:
     --save-every 10 --seed 42 [--val-split 0.1]
 ```
 
-### prepare stage
+Until `prepare` exists, build the tensor cache by hand with
+`dit_train_sample_write()` (`src/dit-train-data.h`) — see
+`tests/gen-train-samples.cpp` for the shapes/conventions `fit` expects.
+
+### prepare stage (planned, Phase 4)
 
 Per audio file in `--dataset`:
 1. Sidecar discovery (Python-compatible): `{name}.lyrics.txt`/`{name}.txt`
@@ -153,15 +158,18 @@ Per audio file in `--dataset`:
 3. Encode (all existing modules): audio → 48kHz stereo → VAE encode →
    `target_latents`; build SFT prompt → BPE → Qwen3 encoder → text_hs;
    lyrics → BPE → embed_tokens → lyric_hs; CondEncoder(text, lyric,
-   timbre=zeros) → `encoder_hidden_states` (+mask); `context_latents` =
+   timbre=zeros) → `encoder_hidden_states`; `context_latents` =
    concat(silence_latent[:T], ones).
-4. Write one GGUF per sample (`{name}.tensors.gguf`) holding the 5 tensors
-   + metadata KV (caption, source path, duration); append to `manifest.json`.
+4. Write one GGUF per sample (`{name}.gguf`) via
+   `dit_train_sample_write()` — same 3-tensor format `fit` already
+   consumes (`target_latents`, `context_latents`, `encoder_hidden`, each
+   unpadded at that sample's exact length; see the decision below on why
+   there's no separate attention_mask tensor).
 
 GGUF as tensor cache = zero new formats, existing reader infra, easy to
 inspect with existing tooling.
 
-### fit stage
+### fit stage (implemented, Phase 3)
 
 Implemented in `src/dit-train.h` / validated by `tests/test-lora-train-smoke.cpp`
 (Phase 2). Design confirmed by that work:
@@ -202,8 +210,25 @@ tensor with the wrong parameter as soon as two samples had different
 shapes. Fix: track our own `m`/`v` per LoRA tensor *by pointer identity* (a
 plain field in our own `DiTTrainLayerMomentum` struct) and call
 `ggml_opt_step_adamw` ourselves — same underlying op, safe under variable
-shapes. Grad clipping (Python's `max_grad_norm=1.0`) is not implemented yet;
-not needed for the Phase 2 overfit check, revisit in Phase 3.
+shapes. Grad clipping (Python's `max_grad_norm=1.0`) is still not
+implemented (Phase 3 didn't need it for the synthetic-data validation run;
+revisit before training on real songs where outlier gradients are more
+plausible).
+
+**Phase 3 split the single training step in two** (`dit_train_forward_backward`
++ `dit_train_optimizer_step`) so `--grad-accum` can actually accumulate
+across several samples before spending an AdamW step. Since each
+micro-batch's backward pass lives in its own fresh, differently-shaped
+`ggml_context`, there's no single persistent graph to add gradients into
+across calls -- so accumulation happens on the *host*: each
+`forward_backward` call reads back that step's freshly computed gradient
+per LoRA tensor and sums it into a plain `std::vector<float>` accumulator
+(`DiTTrainProjGradAccum`, parallel to the LoRA structure). `optimizer_step`
+then builds one small graph (no forward pass, just one
+`GGML_OP_OPT_STEP_ADAMW` view-node per tensor), uploads the accumulator
+divided by the micro-batch count as that op's `grad` input, runs it, and
+zeroes the accumulator. Cheap regardless of `grad_accum`: the graph is
+`O(n_layers * 8)` nodes, not tied to sequence length at all.
 
 ### Phase plan
 
@@ -231,9 +256,33 @@ not needed for the Phase 2 overfit check, revisit in Phase 3.
   production T (~2000+ latent frames); this test uses small synthetic
   T/enc_S (32/8) to iterate quickly. CPU backend path not yet exercised
   (only CUDA available on the dev machine used for this phase).
-- [ ] **Phase 3 — `ace-train fit`**
-  Full loop: dataset iteration, shuffling, grad accum, LR schedule,
-  checkpoints, val split, logging.
+- [x] **Phase 3 — `ace-train fit`**
+  `tools/ace-train.cpp` (subcommand dispatch: `fit` implemented, `prepare`
+  reports "not yet, see Phase 4" rather than guessing) +
+  `src/dit-train-data.h` (per-sample tensor cache: 3 unpadded GGUF tensors —
+  `target_latents`, `context_latents`, `encoder_hidden` — read/written via
+  the existing `gguf.h` reader/writer, no new format). `dit-train.h` gained
+  `dit_train_forward_backward`/`dit_train_optimizer_step` (split for grad
+  accumulation, see Design above), `dit_train_eval` (forward-only, for
+  validation), and `dit_train_save_checkpoint` (PEFT directory via
+  `safetensors-write.h`). The fit loop: shuffles + splits samples
+  (`--val-split`), resamples noise + a discrete turbo timestep per sample
+  per pass (matching the Python trainer), groups samples into
+  `--grad-accum`-sized micro-batches (leftover partial batch at epoch end
+  handled correctly), applies the warmup+cosine LR schedule per optimizer
+  step, evaluates on the held-out split every epoch (best-loss checkpoint),
+  and saves periodic + final checkpoints.
+  **Validated end to end** with `tests/gen-train-samples.cpp` (synthetic
+  sample generator, since Phase 4 doesn't exist yet) against the real
+  24-layer `acestep-v15-turbo-Q8_0.gguf`: full fit run completes (shuffle,
+  accumulate, schedule, checkpoint, val-eval) and the resulting
+  `final/adapter_model.safetensors` loads through the *actual production*
+  `ace-synth --adapters` path — **192/192 tensors merged, 0 skipped** — and
+  renders a track. Also exercised uneven `--grad-accum` (sample count not a
+  multiple of the accumulation window) with no error. Two bugs found and
+  fixed during this phase (both in `dit_train_sample_write`/the ctx-memory
+  budget it uses, and the usage-string program-name bug in `ace-train.cpp`)
+  — see Decisions log.
 - [ ] **Phase 4 — `ace-train prepare`**
   Sidecar scan + understand decoration + tensor GGUF cache. (After fit so
   early fit testing can use hand-built tensors from the existing pipelines.)
@@ -287,6 +336,33 @@ not needed for the Phase 2 overfit check, revisit in Phase 3.
   Q8_0/K-quant checkpoint). Purely additive: existing callers only ever
   passed BF16/F16/F32 tensors, so inference is unaffected (re-verified with
   a full ace-lm/ace-synth round trip after the change).
+- 2026-07-23: sample tensor cache (`src/dit-train-data.h`) drops
+  `attention_mask`/`encoder_attention_mask` from the design doc's original
+  5-tensor plan. Each sample is trained at its own exact, unpadded length
+  (N=1 per graph build, never batched), so an all-valid mask is already
+  correct — `dit-train.h` already builds one internally. Only revisit this
+  if/when samples are ever batched to N>1 in one graph.
+- 2026-07-23: Phase 3 gradient accumulation happens on the **host**, not in
+  a persistent graph. Each micro-batch's backward pass lives in its own
+  fresh, differently-shaped `ggml_context` (T/enc_S vary per sample), so
+  there's no single graph node to accumulate into across calls the way a
+  fixed-shape training loop could. `dit_train_forward_backward` reads back
+  each LoRA tensor's freshly computed gradient and sums it into a plain
+  host `std::vector<float>`; `dit_train_optimizer_step` uploads the
+  averaged sum as a small forward-only graph's `grad` input. Simple, and
+  cheap regardless of `grad_accum` since the tensors are LoRA-sized
+  (kilobytes), not backbone-sized.
+- 2026-07-23: two bugs found by Phase 3's end-to-end run, both fixed:
+  (1) `dit_train_sample_write()` (`src/dit-train-data.h`) allocated its
+  `ggml_context` with `no_alloc=false` but only budgeted tensor *struct*
+  overhead, not the tensor *data* itself — crashed
+  (`ggml_new_object: not enough space`) on the first real sample larger
+  than a few hundred bytes. Fixed by adding the actual data byte count
+  (`64*T + 128*T + H_enc*enc_S` floats) to the context size.
+  (2) `tools/ace-train.cpp`'s `run_fit()` used the post-subcommand-shifted
+  `argv[0]` (i.e. the first *flag*, not the program name) in its own usage
+  string. Fixed by passing the real `argv[0]` through explicitly from
+  `main()`.
 
 ## Progress log
 
@@ -299,8 +375,20 @@ not needed for the Phase 2 overfit check, revisit in Phase 3.
 - 2026-07-23: Phase 2 complete. LoRA training graph (forward + backward +
   AdamW) validated end-to-end on the full 24-layer production DiT; found
   and fixed two real bugs (garbage fusion-pointer fields, unseeded loss
-  gradient) along the way — see Decisions log. Next up: Phase 3, the
-  `ace-train fit` CLI (dataset iteration, LR schedule, checkpoints).
+  gradient) along the way — see Decisions log.
+- 2026-07-23: Phase 3 complete. `ace-train fit` CLI + per-sample tensor
+  cache (`src/dit-train-data.h`) + gradient-accumulation split in
+  `dit-train.h` (forward_backward/optimizer_step/eval/save_checkpoint).
+  Validated end to end on the real 24-layer turbo DiT with a synthetic
+  sample generator (`tests/gen-train-samples.cpp`, since Phase 4 doesn't
+  exist yet): full fit run (shuffle, grad-accum incl. uneven leftover
+  batches, LR schedule, val-split, checkpointing) completes cleanly, and
+  the resulting checkpoint loads through the *actual* `ace-synth
+  --adapters` production path with 192/192 tensors merged, 0 skipped, and
+  renders a track. Two small bugs found and fixed — see Decisions log.
+  Next up: Phase 4, `ace-train prepare` (real dataset decoration via the
+  understand pipeline + VAE/text/cond encoding, replacing the synthetic
+  generator).
 
 ## Verification checklist (running)
 
@@ -312,9 +400,21 @@ not needed for the Phase 2 overfit check, revisit in Phase 3.
       (`tests/test-lora-train-smoke.cpp`)
 - [x] Overfit single sample: loss → ~0 (1.78 → 0.000047 over 150 steps,
       full 24-layer model)
+- [x] `ace-train fit` runs a full loop (shuffle, grad-accum incl. uneven
+      leftover batches, LR warmup+cosine schedule, val-split eval,
+      periodic + best + final checkpoints) against real sample tensor
+      files with no crash or FATAL
+- [x] `ace-train fit`'s checkpoint output loads through the *production*
+      `ace-synth --adapters` path (192/192 tensors merged, 0 skipped) and
+      renders audio
 - [ ] Same backward graph verified on CPU backend specifically
 - [ ] soft_max_ext backward correct with a *non-trivial* attention mask
-      (smoke test uses all-valid masks; real padding not yet exercised)
-- [ ] VRAM measured at production T (~2000+ latent frames)
-- [ ] prepare-stage tensors match Python preprocessed .pt (cossim) on one sample
-- [ ] Trained LoRA audibly shifts style in ace-synth output
+      (smoke test and fit loop both use all-valid masks so far; real
+      padding never exercised, though the current design avoids padding
+      by training each sample at its own exact length)
+- [ ] VRAM measured at production T (~2000+ latent frames); Phase 3's
+      end-to-end run used small synthetic T (16-48) to iterate quickly
+- [ ] prepare-stage tensors match Python preprocessed .pt (cossim) on one
+      sample (blocked on Phase 4)
+- [ ] Trained LoRA audibly shifts style in ace-synth output (needs a real
+      dataset + Phase 4, not just the synthetic-data smoke test)

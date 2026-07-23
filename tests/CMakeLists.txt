@@ -27,3 +27,9 @@ link_ggml_backends(test-lora-roundtrip)
 add_executable(test-lora-train-smoke test-lora-train-smoke.cpp)
 target_link_libraries(test-lora-train-smoke PRIVATE acestep-core)
 link_ggml_backends(test-lora-train-smoke)
+
+# gen-train-samples: synthetic sample tensor generator for testing
+# `ace-train fit` end to end ahead of Phase 4 (`ace-train prepare`).
+add_executable(gen-train-samples gen-train-samples.cpp)
+target_include_directories(gen-train-samples PRIVATE ${CMAKE_SOURCE_DIR}/src)
+link_ggml_backends(gen-train-samples)

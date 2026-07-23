@@ -131,6 +131,11 @@ add_executable(ace-lm tools/ace-lm.cpp)
 target_link_libraries(ace-lm PRIVATE acestep-core)
 link_ggml_backends(ace-lm)
 
+# ace-train: native LoRA training (fit) + dataset preparation (prepare, Phase 4)
+add_executable(ace-train tools/ace-train.cpp)
+target_link_libraries(ace-train PRIVATE acestep-core)
+link_ggml_backends(ace-train)
+
 # webui: convert tools/webui/public/index.html.gz to a C header for embedding.
 # the .gz is committed to git so the C++ build works without npm.
 # to update: cd tools/webui && npm install && npm run build, then rebuild ace-server.

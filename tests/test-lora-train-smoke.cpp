@@ -132,8 +132,7 @@ int main(int argc, char ** argv) {
     // Fixed noise + timestep: this is a classic single-example overfit test
     // (loss -> ~0), so (x0, x1, t) together form ONE regression target held
     // constant across every step. Real training resamples x1/t per pass
-    // instead (see dit_train_step's docstring) -- that's exercised by the
-    // longer, noisier run in test-lora-train-smoke's --resample mode.
+    // instead (see tools/ace-train.cpp's fit loop, Phase 3).
     std::mt19937                       data_rng2(seed + 2);
     std::uniform_int_distribution<int> t_idx_dist(0, 7);
     std::vector<float>                 noise((size_t) T * Oc);
@@ -159,8 +158,9 @@ int main(int argc, char ** argv) {
     losses.reserve(steps);
 
     for (int step = 0; step < steps; step++) {
-        float loss = dit_train_step(&trainer, T, enc_S, target_latents.data(), context_latents.data(),
-                                    enc_hidden.data(), noise.data(), t_val);
+        float loss = dit_train_forward_backward(&trainer, T, enc_S, target_latents.data(), context_latents.data(),
+                                                enc_hidden.data(), noise.data(), t_val);
+        dit_train_optimizer_step(&trainer);
         losses.push_back(loss);
 
         if (!std::isfinite(loss)) {
