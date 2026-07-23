@@ -441,6 +441,139 @@ static bool dit_ggml_load(DiTGGML *    m,
     return true;
 }
 
+// Load DiT for training (src/dit-train.h): every weight the training
+// backward pass touches must be F32, since CUDA's OUT_PROD kernel (used by
+// mul_mat's backward w.r.t. its activation input) is F32-only, and gradient
+// must flow through the frozen backbone to reach every layer's LoRA branch.
+// Differences from dit_ggml_load():
+//   - every projection loaded via gf_load_tensor_f32 (generic dequant),
+//     never gf_load_tensor: no quantized/BF16 weight enters the graph.
+//   - QKV/pair/gate-up fusion is never attempted (LoRA injects per
+//     individual projection; dit-graph.h only threads lora_layers through
+//     the "all separate" code paths).
+//   - flash_attn_ext has no backward: use_flash_attn is forced false, the
+//     no-FA dit_attn_f32 path runs unconditionally.
+//   - no adapter merge (LoRA here is trained fresh, not a static merge).
+// max_layers: 0 loads every layer in the GGUF; a positive value caps the
+// model to its first N layers, for cheap structural smoke tests.
+static bool dit_ggml_load_train(DiTGGML * m, const char * gguf_path, int max_layers = 0) {
+    // Zero every field first: unlike dit_ggml_load(), this loader never
+    // assigns the fusion-candidate fields (sa_qkv, sa_qk, ca_qkv, ca_kv,
+    // gate_up) since training always uses the all-separate path. Without
+    // this, those fields hold indeterminate values on the caller's struct
+    // (garbage, not nullptr), and dit_ggml_build_self_attn/build_cross_attn/
+    // build_mlp would sporadically take the fused branch and read a bogus
+    // tensor pointer.
+    *m = {};
+
+    BackendPair bp    = backend_init("DiT-Train");
+    m->backend        = bp.backend;
+    m->cpu_backend    = bp.cpu_backend;
+    m->sched          = backend_sched_new(bp, 32768);
+    m->use_flash_attn = false;  // flash_attn_ext has no backward
+
+    GGUFModel gf;
+    if (!gf_load(&gf, gguf_path)) {
+        fprintf(stderr, "[Load] FATAL: cannot load %s\n", gguf_path);
+        return false;
+    }
+
+    DiTGGMLConfig & cfg         = m->cfg;
+    uint32_t        block_count = gf_get_u32(gf, "acestep-dit.block_count");
+    cfg.n_layers                = (int) block_count;
+    cfg.hidden_size             = (int) gf_get_u32(gf, "acestep-dit.embedding_length");
+    cfg.intermediate_size       = (int) gf_get_u32(gf, "acestep-dit.feed_forward_length");
+    cfg.n_heads                 = (int) gf_get_u32(gf, "acestep-dit.attention.head_count");
+    cfg.n_kv_heads              = (int) gf_get_u32(gf, "acestep-dit.attention.head_count_kv");
+    cfg.head_dim                = (int) gf_get_u32(gf, "acestep-dit.attention.key_length");
+    cfg.in_channels             = (int) gf_get_u32(gf, "acestep.in_channels");
+    cfg.out_channels            = (int) gf_get_u32(gf, "acestep.audio_acoustic_hidden_dim");
+    cfg.patch_size              = (int) gf_get_u32(gf, "acestep.patch_size");
+    cfg.sliding_window          = (int) gf_get_u32(gf, "acestep.sliding_window");
+    cfg.rope_theta              = gf_get_f32(gf, "acestep-dit.rope.freq_base");
+    cfg.rms_norm_eps            = gf_get_f32(gf, "acestep-dit.attention.layer_norm_rms_epsilon");
+
+    if (!cfg.n_layers || !cfg.hidden_size || !cfg.intermediate_size || !cfg.n_heads || !cfg.n_kv_heads ||
+        !cfg.head_dim || !cfg.in_channels || !cfg.out_channels || !cfg.patch_size || !cfg.sliding_window ||
+        cfg.rope_theta <= 0.0f || cfg.rms_norm_eps <= 0.0f || block_count > (uint32_t) DIT_GGML_MAX_LAYERS) {
+        fprintf(stderr, "[Load] FATAL: invalid DiT config in GGUF\n");
+        gf_close(&gf);
+        return false;
+    }
+
+    if (max_layers > 0 && max_layers < cfg.n_layers) {
+        fprintf(stderr, "[Load] Training: capping %d layers to %d\n", cfg.n_layers, max_layers);
+        cfg.n_layers = max_layers;
+    }
+
+    int n_tensors = 6 * 2 + 2 + 2 + 19 * cfg.n_layers + 4 + 1 + 1;
+    wctx_init(&m->wctx, n_tensors);
+
+    dit_ggml_load_temb(&m->time_embed, &m->wctx, gf, "decoder.time_embed");
+    dit_ggml_load_temb(&m->time_embed_r, &m->wctx, gf, "decoder.time_embed_r");
+
+    m->proj_in_w =
+        dit_load_proj_in_w(&m->wctx, gf, "decoder.proj_in.1.weight", cfg.hidden_size, cfg.in_channels, cfg.patch_size);
+    m->proj_in_b = gf_load_tensor_f32(&m->wctx, gf, "decoder.proj_in.1.bias");
+
+    m->cond_emb_w = gf_load_tensor_f32(&m->wctx, gf, "decoder.condition_embedder.weight");
+    m->cond_emb_b = gf_load_tensor_f32(&m->wctx, gf, "decoder.condition_embedder.bias");
+
+    for (int i = 0; i < cfg.n_layers; i++) {
+        char prefix[128];
+        snprintf(prefix, sizeof(prefix), "decoder.layers.%d", i);
+        std::string    p(prefix);
+        DiTGGMLLayer & ly = m->layers[i];
+
+        ly.self_attn_norm = gf_load_tensor_f32(&m->wctx, gf, p + ".self_attn_norm.weight");
+        ly.sa_q_proj      = gf_load_tensor_f32(&m->wctx, gf, p + ".self_attn.q_proj.weight");
+        ly.sa_k_proj      = gf_load_tensor_f32(&m->wctx, gf, p + ".self_attn.k_proj.weight");
+        ly.sa_v_proj      = gf_load_tensor_f32(&m->wctx, gf, p + ".self_attn.v_proj.weight");
+        ly.sa_q_norm      = gf_load_tensor_f32(&m->wctx, gf, p + ".self_attn.q_norm.weight");
+        ly.sa_k_norm      = gf_load_tensor_f32(&m->wctx, gf, p + ".self_attn.k_norm.weight");
+        ly.sa_o_proj      = gf_load_tensor_f32(&m->wctx, gf, p + ".self_attn.o_proj.weight");
+
+        ly.cross_attn_norm = gf_load_tensor_f32(&m->wctx, gf, p + ".cross_attn_norm.weight");
+        ly.ca_q_proj       = gf_load_tensor_f32(&m->wctx, gf, p + ".cross_attn.q_proj.weight");
+        ly.ca_k_proj       = gf_load_tensor_f32(&m->wctx, gf, p + ".cross_attn.k_proj.weight");
+        ly.ca_v_proj       = gf_load_tensor_f32(&m->wctx, gf, p + ".cross_attn.v_proj.weight");
+        ly.ca_q_norm       = gf_load_tensor_f32(&m->wctx, gf, p + ".cross_attn.q_norm.weight");
+        ly.ca_k_norm       = gf_load_tensor_f32(&m->wctx, gf, p + ".cross_attn.k_norm.weight");
+        ly.ca_o_proj       = gf_load_tensor_f32(&m->wctx, gf, p + ".cross_attn.o_proj.weight");
+
+        ly.mlp_norm  = gf_load_tensor_f32(&m->wctx, gf, p + ".mlp_norm.weight");
+        ly.gate_proj = gf_load_tensor_f32(&m->wctx, gf, p + ".mlp.gate_proj.weight");
+        ly.up_proj   = gf_load_tensor_f32(&m->wctx, gf, p + ".mlp.up_proj.weight");
+        ly.down_proj = gf_load_tensor_f32(&m->wctx, gf, p + ".mlp.down_proj.weight");
+
+        ly.scale_shift_table = gf_load_tensor_f32(&m->wctx, gf, p + ".scale_shift_table");
+
+        ly.layer_type = (i % 2 == 0) ? 0 : 1;
+    }
+
+    m->norm_out        = gf_load_tensor_f32(&m->wctx, gf, "decoder.norm_out.weight");
+    m->out_scale_shift = gf_load_tensor_f32(&m->wctx, gf, "decoder.scale_shift_table");
+    m->proj_out_w = dit_load_proj_out_w(&m->wctx, gf, "decoder.proj_out.1.weight", cfg.hidden_size, cfg.out_channels,
+                                        cfg.patch_size);
+    m->proj_out_b = gf_load_tensor_f32(&m->wctx, gf, "decoder.proj_out.1.bias");
+
+    m->null_condition_emb = gf_try_load_tensor(&m->wctx, gf, "null_condition_emb");
+
+    static const float one_val = 1.0f;
+    m->scalar_one              = ggml_new_tensor_1d(m->wctx.ctx, GGML_TYPE_F32, 1);
+    m->wctx.pending.push_back({ m->scalar_one, &one_val, sizeof(float), 0 });
+
+    if (!wctx_alloc(&m->wctx, m->backend)) {
+        gf_close(&gf);
+        return false;
+    }
+    gf_close(&gf);
+
+    fprintf(stderr, "[Load] DiT (train, F32): %d layers, H=%d, Nh=%d/%d, D=%d\n", cfg.n_layers, cfg.hidden_size,
+            cfg.n_heads, cfg.n_kv_heads, cfg.head_dim);
+    return true;
+}
+
 static void dit_ggml_free(DiTGGML * m) {
     if (m->sched) {
         ggml_backend_sched_free(m->sched);

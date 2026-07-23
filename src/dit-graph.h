@@ -75,6 +75,44 @@ static struct ggml_tensor * dit_ggml_gated_add(struct ggml_context * ctx,
     return ggml_add(ctx, residual, gated);
 }
 
+// ---- LoRA training support -------------------------------------------------
+//
+// Optional, additive-only extension used by src/dit-train.h. Every builder
+// below takes the LoRA bundle as a trailing pointer defaulting to NULL, so
+// existing inference call sites (dit-sampler.h) are byte-identical: passing
+// NULL skips every branch added here.
+//
+// A tensor: ggml ne=(in_feat, rank)  (PyTorch row major [rank, in_feat])
+// B tensor: ggml ne=(rank, out_feat) (PyTorch row major [out_feat, rank])
+// delta = scaling * B @ (A @ x), scaling = alpha / rank. Only valid on the
+// "all separate" QKV/GateUp code paths: fused-weight inference paths never
+// receive a non-NULL lora pointer (the training loader never fuses).
+struct DiTLoraProj {
+    struct ggml_tensor * A       = nullptr;
+    struct ggml_tensor * B       = nullptr;
+    float                scaling = 1.0f;
+};
+
+struct DiTLoraLayer {
+    DiTLoraProj sa_q, sa_k, sa_v, sa_o;
+    DiTLoraProj ca_q, ca_k, ca_v, ca_o;
+};
+
+static struct ggml_tensor * dit_lora_delta(struct ggml_context * ctx, const DiTLoraProj * lp, struct ggml_tensor * x) {
+    if (!lp || !lp->A || !lp->B) {
+        return nullptr;
+    }
+    struct ggml_tensor * h = dit_ggml_linear(ctx, lp->A, x);  // [rank, S, N]
+    struct ggml_tensor * d = dit_ggml_linear(ctx, lp->B, h);  // [out_feat, S, N]
+    return ggml_scale(ctx, d, lp->scaling);
+}
+
+static struct ggml_tensor * dit_ggml_add_lora(struct ggml_context * ctx,
+                                              struct ggml_tensor *  base,
+                                              struct ggml_tensor *  delta) {
+    return delta ? ggml_add(ctx, base, delta) : base;
+}
+
 // Build timestep embedding subgraph
 // t_scalar: [1] f32, returns temb [H] and *out_tproj [6H]
 // suffix: "_t" or "_r" for naming intermediate tensors
@@ -145,7 +183,8 @@ static struct ggml_tensor * dit_ggml_build_self_attn(
     struct ggml_tensor *  mask,       // [S, S] or NULL (sliding window mask)
     int                   S,
     int                   N,
-    int                   layer_idx = -1) {
+    int                   layer_idx  = -1,
+    const DiTLoraLayer *  lora       = nullptr) {
     DiTGGMLConfig & c   = m->cfg;
     int             D   = c.head_dim;
     int             Nh  = c.n_heads;
@@ -170,6 +209,11 @@ static struct ggml_tensor * dit_ggml_build_self_attn(
         q = dit_ggml_linear(ctx, ly->sa_q_proj, norm_sa);
         k = dit_ggml_linear(ctx, ly->sa_k_proj, norm_sa);
         v = dit_ggml_linear(ctx, ly->sa_v_proj, norm_sa);
+        if (lora) {
+            q = dit_ggml_add_lora(ctx, q, dit_lora_delta(ctx, &lora->sa_q, norm_sa));
+            k = dit_ggml_add_lora(ctx, k, dit_lora_delta(ctx, &lora->sa_k, norm_sa));
+            v = dit_ggml_add_lora(ctx, v, dit_lora_delta(ctx, &lora->sa_v, norm_sa));
+        }
     }
 
     // 2) Reshape to heads: [Nh*D, S, N] -> [D, Nh, S, N]
@@ -241,6 +285,9 @@ static struct ggml_tensor * dit_ggml_build_self_attn(
 
     // 8) O projection: [Nh*D, S, N] -> [H, S, N]
     struct ggml_tensor * out = dit_ggml_linear(ctx, ly->sa_o_proj, attn);
+    if (lora) {
+        out = dit_ggml_add_lora(ctx, out, dit_lora_delta(ctx, &lora->sa_o, attn));
+    }
     return out;
 }
 
@@ -281,7 +328,8 @@ static struct ggml_tensor * dit_ggml_build_cross_attn(struct ggml_context * ctx,
                                                       struct ggml_tensor *  mask,       // [enc_S, S, 1, N] F16 or NULL
                                                       int                   S,
                                                       int                   enc_S,
-                                                      int                   N) {
+                                                      int                   N,
+                                                      const DiTLoraLayer *  lora = nullptr) {
     DiTGGMLConfig & c   = m->cfg;
     int             D   = c.head_dim;
     int             Nh  = c.n_heads;
@@ -312,6 +360,11 @@ static struct ggml_tensor * dit_ggml_build_cross_attn(struct ggml_context * ctx,
         q = dit_ggml_linear(ctx, ly->ca_q_proj, norm_ca);
         k = dit_ggml_linear(ctx, ly->ca_k_proj, enc);
         v = dit_ggml_linear(ctx, ly->ca_v_proj, enc);
+        if (lora) {
+            q = dit_ggml_add_lora(ctx, q, dit_lora_delta(ctx, &lora->ca_q, norm_ca));
+            k = dit_ggml_add_lora(ctx, k, dit_lora_delta(ctx, &lora->ca_k, enc));
+            v = dit_ggml_add_lora(ctx, v, dit_lora_delta(ctx, &lora->ca_v, enc));
+        }
     }
 
     // reshape to [D, heads, seq, N] then permute to [D, seq, heads, N]
@@ -355,7 +408,11 @@ static struct ggml_tensor * dit_ggml_build_cross_attn(struct ggml_context * ctx,
     attn = ggml_reshape_3d(ctx, attn, Nh * D, S, N);
 
     // O projection
-    return dit_ggml_linear(ctx, ly->ca_o_proj, attn);
+    struct ggml_tensor * out = dit_ggml_linear(ctx, ly->ca_o_proj, attn);
+    if (lora) {
+        out = dit_ggml_add_lora(ctx, out, dit_lora_delta(ctx, &lora->ca_o, attn));
+    }
+    return out;
 }
 
 // Build one full DiT layer (AdaLN + self-attn + cross-attn + FFN + gated residuals)
@@ -375,7 +432,8 @@ static struct ggml_tensor * dit_ggml_build_layer(struct ggml_context * ctx,
                                                  struct ggml_tensor *  ca_mask,    // [enc_S, S, 1, N] or NULL
                                                  int                   S,
                                                  int                   enc_S,
-                                                 int                   N) {
+                                                 int                   N,
+                                                 const DiTLoraLayer *  lora = nullptr) {
     DiTGGMLConfig & c  = m->cfg;
     DiTGGMLLayer *  ly = &m->layers[layer_idx];
     int             H  = c.hidden_size;
@@ -410,7 +468,8 @@ static struct ggml_tensor * dit_ggml_build_layer(struct ggml_context * ctx,
     }
 
     // sa_mask is pre-selected by the caller (sliding window for layer_type=0, NULL for layer_type=1)
-    struct ggml_tensor * sa_out = dit_ggml_build_self_attn(ctx, m, ly, norm_sa, positions, sa_mask, S, N, layer_idx);
+    struct ggml_tensor * sa_out =
+        dit_ggml_build_self_attn(ctx, m, ly, norm_sa, positions, sa_mask, S, N, layer_idx, lora);
 
     if (layer_idx == 0) {
         ggml_set_name(sa_out, "layer0_sa_output");
@@ -428,7 +487,7 @@ static struct ggml_tensor * dit_ggml_build_layer(struct ggml_context * ctx,
     if (enc) {
         struct ggml_tensor * norm_ca = dit_ggml_rms_norm_weighted(ctx, hidden, ly->cross_attn_norm, c.rms_norm_eps);
         struct ggml_tensor * ca_out =
-            dit_ggml_build_cross_attn(ctx, m, ly, norm_ca, enc, positions, ca_mask, S, enc_S, N);
+            dit_ggml_build_cross_attn(ctx, m, ly, norm_ca, enc, positions, ca_mask, S, enc_S, N, lora);
         hidden = ggml_add(ctx, hidden, ca_out);
     }
 
@@ -462,20 +521,26 @@ static struct ggml_tensor * dit_ggml_build_layer(struct ggml_context * ctx,
 //
 // Graph outputs:
 //   "velocity"        [out_channels, T, N]  predicted flow velocity
-static struct ggml_cgraph * dit_ggml_build_graph(DiTGGML *             m,
-                                                 struct ggml_context * ctx,
-                                                 int                   T,           // temporal length (before patching)
-                                                 int                   enc_S,       // encoder sequence length
-                                                 int                   N,           // batch size
-                                                 struct ggml_tensor ** p_input,     // [out] input tensor to fill
-                                                 struct ggml_tensor ** p_output) {  // [out] output tensor to read
+static struct ggml_cgraph * dit_ggml_build_graph(
+    DiTGGML *             m,
+    struct ggml_context * ctx,
+    int                   T,                        // temporal length (before patching)
+    int                   enc_S,                     // encoder sequence length
+    int                   N,                          // batch size
+    struct ggml_tensor ** p_input,                    // [out] input tensor to fill
+    struct ggml_tensor ** p_output,                    // [out] output tensor to read
+    const DiTLoraLayer *  lora_layers = nullptr,        // [in] per-layer LoRA bundle array (training only), or NULL
+    bool                  want_grads  = false) {         // [in] allocate the graph with gradient support (training only)
 
     DiTGGMLConfig & c = m->cfg;
     int             S = T / c.patch_size;  // sequence length after patching
     int             H = c.hidden_size;
     int             P = c.patch_size;
 
-    struct ggml_cgraph * gf = ggml_new_graph_custom(ctx, 8192, false);
+    // Backward roughly doubles node count vs forward, plus per-parameter
+    // optimizer step nodes appended by the caller (src/dit-train.h).
+    size_t                graph_size = want_grads ? 32768 : 8192;
+    struct ggml_cgraph * gf         = ggml_new_graph_custom(ctx, graph_size, want_grads);
 
     // Inputs
 
@@ -573,7 +638,8 @@ static struct ggml_cgraph * dit_ggml_build_graph(DiTGGML *             m,
     for (int i = 0; i < c.n_layers; i++) {
         // layer_type=0 (sliding window): sa_mask_sw, layer_type=1 (full): unmasked
         struct ggml_tensor * sa_mask = (m->layers[i].layer_type == 0) ? sa_mask_sw : nullptr;
-        hidden = dit_ggml_build_layer(ctx, m, i, hidden, tproj, enc, positions, sa_mask, ca_mask, S, enc_S, N);
+        const DiTLoraLayer * lora    = lora_layers ? &lora_layers[i] : nullptr;
+        hidden = dit_ggml_build_layer(ctx, m, i, hidden, tproj, enc, positions, sa_mask, ca_mask, S, enc_S, N, lora);
         // Debug dumps at key layers: 0, 6, 12, 18, last
         if (i == 0 || i == 6 || i == 12 || i == 18 || i == c.n_layers - 1) {
             char lname[64];

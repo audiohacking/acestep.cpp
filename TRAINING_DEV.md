@@ -67,11 +67,11 @@ padding a non-issue there); we match by training at true length per sample.
 
 The GGML fork already contains everything needed to train:
 
-- `ggml/include/ggml-opt.h`: full training module. AdamW + SGD, MSE loss,
-  gradient accumulation (`opt_period`), per-step optimizer params callback
-  (implements warmup+cosine LR host-side), dynamic-graph mode
-  (`ggml_opt_prepare_alloc` per step) which handles variable song lengths
-  without padding.
+- `ggml/include/ggml-opt.h`: full training module (AdamW + SGD, MSE loss,
+  gradient accumulation). **Not used directly** — see Phase 2 below for why
+  its high-level dataset/epoch API is unsafe for our variable-T graphs, and
+  what we use instead (`ggml_build_backward_expand` + `ggml_opt_step_adamw`
+  called directly, momentum tracked by our own parameter identity).
 - `ggml_build_backward_expand` covers every op in the DiT training graph:
   ADD, SUB, MUL, MUL_MAT, SCALE, CONT, RESHAPE, VIEW, PERMUTE, TRANSPOSE,
   CPY/CAST, RMS_NORM, ROPE, SOFT_MAX (mask ok if mask needs no grads —
@@ -163,32 +163,47 @@ inspect with existing tooling.
 
 ### fit stage
 
-1. Load DiT from GGUF, dequant weights on the backward path to F32
-   (constraint 1a). Frozen — never touched by the optimizer.
-2. Create LoRA tensors A[r, in] (init: kaiming/normal·0.01) and B[out, r]
-   (init: zeros) in F32 for each target projection in each layer;
-   `ggml_set_param` on all of them.
-3. Build training graph per sample length (dynamic-graph ggml-opt mode):
-   host computes xt, flow target, samples t (std::mt19937 seeded by
-   config.seed) → inputs; graph = DiT forward (no-FA, split-swiglu,
-   LoRA branches) → outputs `v_pred`; labels = flow; loss = MSE.
-4. Optimizer loop: `ggml_opt_alloc(backward=true)` + `ggml_opt_eval` per
-   sample; `opt_period = grad_accum`; LR callback implements linear warmup
-   → cosine annealing (eta_min = lr·0.01). Log per-step loss + EMA to
-   stderr (SSE-friendly single-line format for later server integration).
-5. Checkpoints every `--save-every` epochs + `final/`:
-   `adapter_model.safetensors` (PEFT key naming
-   `base_model.model.layers.N.{self_attn,cross_attn}.{q,k,v,o}_proj.lora_{A,B}.weight`)
-   + `adapter_config.json` (r, lora_alpha, target_modules). Must load
-   unmodified through `src/adapter-merge.h` → instantly usable in the WebUI.
-6. Optional `--val-split`: held-out samples evaluated per epoch (forward
-   only), best checkpoint tracked.
+Implemented in `src/dit-train.h` / validated by `tests/test-lora-train-smoke.cpp`
+(Phase 2). Design confirmed by that work:
 
-Grad clipping (max_grad_norm=1.0): ggml-opt has no built-in clipping; read
-back LoRA grads (`ggml_opt_grad_acc`), compute global norm host-side, scale
-LR for that step accordingly (equivalent effect), or add clip to fork later.
-Total LoRA params at r=8 on 24 layers ≈ 24 layers × 8 proj × (2048·8+8·2048)
-≈ 6.3M params → grad readback is cheap.
+1. Load DiT from GGUF via `dit_ggml_load_train()` (F32 everywhere, always
+   the all-separate QKV/gate-up path, `use_flash_attn=false`). Frozen —
+   never touched by the optimizer.
+2. Create LoRA tensors A (`ggml ne=(in,rank)`, N(0, 1/sqrt(in))) and B
+   (`ggml ne=(rank,out)`, zero-init — standard LoRA convention, adapter
+   starts as a no-op) in F32 for every self_attn/cross_attn q/k/v/o_proj at
+   every layer, plus an AdamW (m, v) pair per tensor. All `ggml_set_param`'d,
+   all held in one persistent `WeightCtx`-backed backend buffer alongside
+   the frozen backbone's buffer, allocated once for the whole run.
+3. Per step, build a **fresh** `ggml_context` (T/enc_S vary per sample) with
+   the DiT forward graph (now takes optional `lora_layers`/`want_grads`
+   params, additive-only — inference call sites pass neither and are
+   byte-identical), a flow-matching MSE loss node, `ggml_build_backward_expand`,
+   then one `ggml_opt_step_adamw` node per LoRA tensor built by hand
+   (bias-corrected LR terms computed host-side into a shared `adamw_params`
+   tensor, matching `ggml-opt.cpp`'s own formula).
+4. Checkpoints: `adapter_model.safetensors` (PEFT key naming
+   `base_model.model.layers.N.{self_attn,cross_attn}.{q,k,v,o}_proj.lora_{A,B}.weight`)
+   + `adapter_config.json` (r, lora_alpha, target_modules), written via
+   `src/safetensors-write.h`. Loads unmodified through `src/adapter-merge.h`
+   → instantly usable in the WebUI (already proven in Phase 1).
+5. Optional `--val-split`: held-out samples evaluated per epoch (forward
+   only, no backward/opt nodes), best checkpoint tracked. Not yet built —
+   Phase 3.
+
+**Why not `ggml-opt`'s high-level dataset/epoch API**: it keys its persistent
+AdamW momentum tensors by *node position* in a graph built once
+(`ggml-opt.cpp:462`, `opt_ctx->grad_m[i]` indexed by the forward graph's
+node array index `i`), on the assumption a "dynamic" graph's *topology*
+(node count/order) stays identical across evals even as the data changes.
+Our forward graph's node count and order shift with T (variable song
+length), so reusing that path would silently associate the wrong momentum
+tensor with the wrong parameter as soon as two samples had different
+shapes. Fix: track our own `m`/`v` per LoRA tensor *by pointer identity* (a
+plain field in our own `DiTTrainLayerMomentum` struct) and call
+`ggml_opt_step_adamw` ourselves — same underlying op, safe under variable
+shapes. Grad clipping (Python's `max_grad_norm=1.0`) is not implemented yet;
+not needed for the Phase 2 overfit check, revisit in Phase 3.
 
 ### Phase plan
 
@@ -203,10 +218,19 @@ Total LoRA params at r=8 on 24 layers ≈ 24 layers × 8 proj × (2048·8+8·204
   192/192 tensors (24 layers x 8 projections) merged, min cosine similarity
   0.999982. Output format is confirmed byte-compatible with what
   `src/adapter-merge.h` already loads for inference.
-- [ ] **Phase 2 — training graph + backward smoke test**
-  DiT forward with LoRA branches on 1 tiny sample; build backward via
-  ggml-opt; confirm no unsupported-op aborts (CPU first, then CUDA); confirm
-  loss decreases on an overfit-one-sample test. Measure VRAM vs T.
+- [x] **Phase 2 — training graph + backward smoke test**
+  `src/dit-train.h` (LoRA injection in `src/dit-graph.h`, additive-only
+  trailing params; F32 training loader in `src/dit.h`) +
+  `tests/test-lora-train-smoke.cpp`. Confirmed on the real
+  `acestep-v15-turbo-Q8_0.gguf`, full 24 layers, no CPU fallback needed
+  (CUDA only): backward builds and computes without any unsupported-op
+  abort, frozen backbone stays bit-identical, LoRA B moves off its zero
+  init, and a fixed single-sample overfit drives loss from 1.78 → 0.000047
+  over 150 steps (clean monotonic convergence). Two real bugs found and
+  fixed along the way — see Decisions log. Not yet measured: VRAM at
+  production T (~2000+ latent frames); this test uses small synthetic
+  T/enc_S (32/8) to iterate quickly. CPU backend path not yet exercised
+  (only CUDA available on the dev machine used for this phase).
 - [ ] **Phase 3 — `ace-train fit`**
   Full loop: dataset iteration, shuffling, grad accum, LR schedule,
   checkpoints, val split, logging.
@@ -231,6 +255,38 @@ Total LoRA params at r=8 on 24 layers ≈ 24 layers × 8 proj × (2048·8+8·204
   (backward coverage); inference paths untouched.
 - 2026-07-23: F32 dequant of DiT weights during training (CUDA out_prod
   constraint); revisit with cast-nodes or fork patch if VRAM-bound.
+- 2026-07-23: hand-roll the training step (`ggml_build_backward_expand` +
+  manual per-tensor `ggml_opt_step_adamw`) instead of `ggml-opt`'s
+  high-level dataset/epoch API — that API's momentum persistence is keyed
+  by graph node position, which is unsafe when T varies per sample (see
+  fit-stage design above). Our own `DiTTrainLayerMomentum` struct keys
+  momentum by parameter identity instead.
+- 2026-07-23: two bugs found by the Phase 2 smoke test, both fixed:
+  (1) `dit_ggml_load_train()` must zero the whole `DiTGGML` struct up
+  front (`*m = {}`) — it never assigns the fusion-candidate fields
+  (`sa_qkv`, `sa_qk`, `ca_qkv`, `ca_kv`, `gate_up`) since training always
+  takes the all-separate path, so on an un-zeroed struct they hold
+  indeterminate garbage instead of nullptr, occasionally taking the wrong
+  (fused) branch in `dit-graph.h` with a mismatched tensor pointer. Bit
+  every layer with nonzero probability, so it passed at 2 layers and
+  crashed at 24 (`ggml_can_mul_mat` assert in `mul_mat`).
+  (2) A freshly built backward graph's loss-gradient accumulator is not
+  seeded to 1.0 by default — `ggml_graph_reset()` normally does that, but
+  it *also* zeroes every `GGML_OP_OPT_STEP_ADAMW` node's momenta
+  (`src[2]`/`src[3]`), which alias our persistent m/v tensors, so calling
+  it every step would erase Adam's cross-step history. Fix: seed only the
+  loss's own grad accumulator directly
+  (`ggml_backend_tensor_set(ggml_graph_get_grad_acc(gf, loss), &onef, ...)`)
+  instead of calling the blanket reset. Symptom before the fix: graph
+  computed and the optimizer step "ran" with no crash, but every gradient
+  was exactly zero, so only weight decay moved the parameters.
+- 2026-07-23: gf_load_tensor_f32 (src/gguf-weights.h) extended to dequant
+  *any* type via the generic `ggml_type_traits->to_float` (previously only
+  BF16/F16; quantized types silently fell back to loading native, which
+  would have defeated the F32-everywhere training requirement on a
+  Q8_0/K-quant checkpoint). Purely additive: existing callers only ever
+  passed BF16/F16/F32 tensors, so inference is unaffected (re-verified with
+  a full ace-lm/ace-synth round trip after the change).
 
 ## Progress log
 
@@ -239,17 +295,26 @@ Total LoRA params at r=8 on 24 layers ≈ 24 layers × 8 proj × (2048·8+8·204
   inventory — **no fork changes required to start**. Branch `training`
   created, plan written.
 - 2026-07-23: Phase 1 complete. safetensors writer + round-trip test added
-  and passing against the real turbo DiT GGUF (see Phase 1 above). Next up:
-  Phase 2, the training graph + backward smoke test.
+  and passing against the real turbo DiT GGUF (see Phase 1 above).
+- 2026-07-23: Phase 2 complete. LoRA training graph (forward + backward +
+  AdamW) validated end-to-end on the full 24-layer production DiT; found
+  and fixed two real bugs (garbage fusion-pointer fields, unseeded loss
+  gradient) along the way — see Decisions log. Next up: Phase 3, the
+  `ace-train fit` CLI (dataset iteration, LR schedule, checkpoints).
 
 ## Verification checklist (running)
 
 - [x] Saved safetensors loads via adapter-merge with correct alpha/rank scaling
       (`tests/test-lora-roundtrip.cpp`, 192/192 tensors, cossim 0.999982)
-- [ ] Backward graph builds without abort for full 24-layer DiT (CPU)
-- [ ] Same on CUDA; scheduler places OUT_PROD/OPT_STEP_ADAMW correctly
-- [ ] soft_max_ext backward correct with attention mask input
-- [ ] LoRA A/B grads nonzero after 1 step; frozen weights bit-identical
-- [ ] Overfit single sample: loss → ~0
+- [x] Backward graph builds without abort for full 24-layer DiT (CUDA;
+      CPU backend not yet exercised, no CPU-only dev machine used so far)
+- [x] LoRA A/B grads nonzero after 1 step; frozen weights bit-identical
+      (`tests/test-lora-train-smoke.cpp`)
+- [x] Overfit single sample: loss → ~0 (1.78 → 0.000047 over 150 steps,
+      full 24-layer model)
+- [ ] Same backward graph verified on CPU backend specifically
+- [ ] soft_max_ext backward correct with a *non-trivial* attention mask
+      (smoke test uses all-valid masks; real padding not yet exercised)
+- [ ] VRAM measured at production T (~2000+ latent frames)
 - [ ] prepare-stage tensors match Python preprocessed .pt (cossim) on one sample
 - [ ] Trained LoRA audibly shifts style in ace-synth output

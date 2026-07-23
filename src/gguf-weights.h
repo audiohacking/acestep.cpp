@@ -229,8 +229,13 @@ static struct ggml_tensor * gf_load_tensor_f32(WeightCtx * wctx, const GGUFModel
         return gf_load_tensor(wctx, gf, name);
     }
 
-    // Bail early on unsupported types (before creating tensor in ctx)
-    if (src->type != GGML_TYPE_BF16 && src->type != GGML_TYPE_F16) {
+    // Generic dequant path for anything to_float can handle (BF16, F16, and
+    // every quantized block type: Q8_0, Q4_K_M, Q5_K_M, Q6_K, ...). Used by
+    // the training loader (src/dit-train.h) to get F32 projection weights
+    // out of a quantized checkpoint: CUDA's OUT_PROD backward kernel is
+    // F32-only, so every weight on the training backward path must be F32.
+    const struct ggml_type_traits * tt = ggml_get_type_traits(src->type);
+    if (!tt->to_float) {
         fprintf(stderr, "[GGUF] WARNING: gf_load_tensor_f32 unsupported type %d for '%s', loading as-is\n", src->type,
                 name.c_str());
         return gf_load_tensor(wctx, gf, name);
@@ -249,14 +254,7 @@ static struct ggml_tensor * gf_load_tensor_f32(WeightCtx * wctx, const GGUFModel
     size_t       offset = gguf_get_tensor_offset(gf.gguf, idx);
     const void * raw    = gf.mapping + gf.data_offset + offset;
 
-    if (src->type == GGML_TYPE_BF16) {
-        const uint16_t * p = (const uint16_t *) raw;
-        for (size_t i = 0; i < n; i++) {
-            data[i] = ggml_bf16_to_fp32(*(const ggml_bf16_t *) &p[i]);
-        }
-    } else {
-        ggml_fp16_to_fp32_row((const ggml_fp16_t *) raw, data, (int) n);
-    }
+    tt->to_float(raw, data, (int64_t) n);
 
     wctx->pending.push_back({ tensor, data, n * sizeof(float), 0 });
     wctx->staging.push_back(std::move(buf));
