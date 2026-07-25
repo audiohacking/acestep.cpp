@@ -79,6 +79,9 @@ Supports LoRA today in two flavours: PEFT directories (with
 `adapter_model.safetensors` + `adapter_config.json`) and ComfyUI single
 `.safetensors` files. Select the active adapter from the WebUI.
 
+Train your own with `ace-train` — native LoRA training, no Python required.
+See [docs/TRAINING.md](docs/TRAINING.md) for a full walkthrough.
+
 ## Server options
 
 ```
@@ -175,7 +178,8 @@ task types, batching, and understand pipeline.
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) covers the complete AceRequest JSON
 reference, all task types (text2music, cover, repaint, lego, extract, complete),
 FSM constrained decoding, custom GGML operators, quantization, and architecture
-internals.
+internals. [docs/TRAINING.md](docs/TRAINING.md) covers native LoRA training
+with `ace-train`.
 
 ## Community
 

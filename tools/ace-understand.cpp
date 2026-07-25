@@ -4,6 +4,7 @@
 //
 // Output: request JSON with metadata + lyrics, reusable as ace-lm or ace-synth input.
 
+#include "audio-analysis.h"
 #include "audio-io.h"
 #include "model-registry.h"
 #include "model-store.h"
@@ -11,6 +12,7 @@
 #include "request.h"
 #include "version.h"
 
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -197,6 +199,20 @@ int main(int argc, char ** argv) {
 
     if (rc != 0) {
         return 1;
+    }
+
+    // The LM is a generative captioner and is unreliable at precise numeric
+    // musical attributes (measured: guessed bpm=71/key=C#minor on a track
+    // with true bpm=126/key=F minor). DSP analysis via Essentia
+    // (RhythmExtractor2013 + KeyExtractor) is authoritative for these two
+    // fields; the LM's caption/lyrics/timesignature/language are untouched.
+    // See TRAINING_DEV.md and src/audio-analysis.h.
+    AudioAnalysisResult ess;
+    if (audio_analyze_bpm_key_from_file(src_audio_path, &ess)) {
+        fprintf(stderr, "[Understand-Essentia] bpm=%.1f (confidence=%.2f), key=%s %s (strength=%.2f)\n", ess.bpm,
+                ess.bpm_confidence, ess.key.c_str(), ess.scale.c_str(), ess.key_strength);
+        out.bpm      = (int) std::lround(ess.bpm);
+        out.keyscale = ess.key + " " + ess.scale;
     }
 
     // write output JSON

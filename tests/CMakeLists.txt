@@ -28,6 +28,13 @@ add_executable(test-lora-train-smoke test-lora-train-smoke.cpp)
 target_link_libraries(test-lora-train-smoke PRIVATE acestep-core)
 link_ggml_backends(test-lora-train-smoke)
 
+# test-grad-compare: dumps a single training step's gradient (real sample,
+# fixed LoRA init/noise/t) for cross-checking against Python. Diagnostic
+# tool, see ../TRAINING_DEV.md.
+add_executable(test-grad-compare test-grad-compare.cpp)
+target_link_libraries(test-grad-compare PRIVATE acestep-core)
+link_ggml_backends(test-grad-compare)
+
 # gen-train-samples: synthetic sample tensor generator for testing
 # `ace-train fit` end to end ahead of Phase 4 (`ace-train prepare`).
 add_executable(gen-train-samples gen-train-samples.cpp)

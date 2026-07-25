@@ -45,6 +45,8 @@ struct FitArgs {
     int   warmup_steps      = 100;
     int   max_layers        = 0;  // 0 = full model; debug-only cap
     int   log_every         = 10;
+    float cfg_ratio         = 0.15f;  // CFG dropout probability (0 = disabled)
+    float max_grad_norm     = 1.0f;  // 0 = disabled; matches Python trainer's default of 1.0
 };
 
 static void usage_fit(const char * prog) {
@@ -69,6 +71,12 @@ static void usage_fit(const char * prog) {
             "  --grad-accum <N>         Micro-batches per optimizer step (default: 4)\n"
             "  --warmup-steps <N>       LR warmup steps, capped to total/10 (default: 100)\n"
             "  --val-split <F>          Fraction of samples held out for validation (default: 0)\n"
+            "  --cfg-ratio <F>          CFG dropout probability, condition -> null embedding\n"
+            "                          (default: 0.15, matches the Python reference's corrected\n"
+            "                          trainer; 0 disables)\n"
+            "  --max-grad-norm <F>      Global gradient-norm clip across all LoRA tensors\n"
+            "                          jointly, applied before the AdamW step (default: 1.0,\n"
+            "                          matches the Python reference; 0 disables)\n"
             "  --seed <N>               RNG seed (default: 42)\n"
             "\n"
             "Checkpoints:\n"
@@ -135,6 +143,10 @@ static int run_fit(const char * prog, int argc, char ** argv) {
             a.warmup_steps = atoi(need("--warmup-steps"));
         } else if (arg == "--val-split") {
             a.val_split = (float) atof(need("--val-split"));
+        } else if (arg == "--max-grad-norm") {
+            a.max_grad_norm = (float) atof(need("--max-grad-norm"));
+        } else if (arg == "--cfg-ratio") {
+            a.cfg_ratio = (float) atof(need("--cfg-ratio"));
         } else if (arg == "--seed") {
             a.seed = (uint32_t) atoi(need("--seed"));
         } else if (arg == "--save-every") {
@@ -216,6 +228,7 @@ static int run_fit(const char * prog, int argc, char ** argv) {
     cfg.alpha         = a.alpha;
     cfg.lr            = a.lr;
     cfg.weight_decay  = a.weight_decay;
+    cfg.max_grad_norm = a.max_grad_norm;
 
     DiTTrain trainer;
     if (!dit_train_init(&trainer, dit_path.c_str(), cfg, a.max_layers, a.seed)) {
@@ -230,10 +243,71 @@ static int run_fit(const char * prog, int argc, char ** argv) {
     fprintf(stderr, "[ace-train] %d epochs x %lld steps/epoch = %lld total optimizer steps (warmup=%lld)\n",
             a.epochs, (long long) steps_per_epoch, (long long) total_steps, (long long) warmup_steps);
 
-    std::mt19937                       train_rng(a.seed + 1);
-    std::mt19937                       data_rng(a.seed + 2);
-    std::normal_distribution<float>    noise_dist(0.0f, 1.0f);
-    std::uniform_int_distribution<int> t_idx_dist(0, 7);
+    std::mt19937                    train_rng(a.seed + 1);
+    std::mt19937                    data_rng(a.seed + 2);
+    std::normal_distribution<float> noise_dist(0.0f, 1.0f);
+
+    // Continuous logit-normal timestep sampling: t = sigmoid(N(mu, sigma)),
+    // mu=-0.4 sigma=1.0 for every ACE-Step model variant (turbo/base/sft
+    // all share these -- "shift" is an inference-only step-schedule
+    // parameter, never applied during training). This is a faithful port
+    // of the model's own sample_t_r() (see acestep-repo's
+    // training_v2/timestep_sampling.py, itself reimplementing
+    // modeling_acestep_v15_turbo.py) -- NOT the discrete 8-value
+    // DIT_TRAIN_TURBO_SHIFT3_TIMESTEPS schedule used until now, which the
+    // Python project's own CLI labels "vanilla (bugged)": training on only
+    // 8 fixed points starves the LoRA of the full continuous timestep
+    // range, so it never learns a smooth, generalizable correction. See
+    // TRAINING_DEV.md.
+    // Python's sample_timesteps() (training_v2/timestep_sampling.py) draws
+    // TWO independent sigmoid(N(mu,sigma)) samples per step and assigns
+    // t=max, r=min -- then forces r=t anyway (data_proportion=1.0 for
+    // every ACE-Step variant during training, since use_meanflow=False).
+    // Net effect: r is discarded, but t itself is the MAX of two draws,
+    // not a single draw -- skews the effective t distribution higher on
+    // average than a single sigmoid(N(mu,sigma)) sample would. Match it
+    // exactly rather than approximate, since "max of 2" is not the same
+    // distribution as "1 draw with a different mu".
+    std::normal_distribution<float> t_logit_dist(-0.4f, 1.0f);
+    auto                             sample_t = [&](std::mt19937 & rng) {
+        float t1 = 1.0f / (1.0f + std::exp(-t_logit_dist(rng)));
+        float t2 = 1.0f / (1.0f + std::exp(-t_logit_dist(rng)));
+        return std::max(t1, t2);
+    };
+
+    // CFG dropout: with probability a.cfg_ratio, replace this step's real
+    // conditioning with the model's own null_condition_emb (broadcast
+    // across every encoder position), matching Python's apply_cfg_dropout.
+    // Without this, the LoRA-modified weights never see the unconditional
+    // branch that real CFG-guided generation also evaluates.
+    std::uniform_real_distribution<float> cfg_dropout_dist(0.0f, 1.0f);
+    std::vector<float>                    null_cond_vec;
+    if (trainer.dit.null_condition_emb) {
+        struct ggml_tensor * nce   = trainer.dit.null_condition_emb;
+        int64_t               emb_n = ggml_nelements(nce);
+        null_cond_vec.resize((size_t) emb_n);
+        if (nce->type == GGML_TYPE_BF16) {
+            std::vector<uint16_t> raw((size_t) emb_n);
+            ggml_backend_tensor_get(nce, raw.data(), 0, (size_t) emb_n * sizeof(uint16_t));
+            for (int64_t j = 0; j < emb_n; j++) {
+                uint32_t w = (uint32_t) raw[(size_t) j] << 16;
+                memcpy(&null_cond_vec[(size_t) j], &w, 4);
+            }
+        } else if (nce->type == GGML_TYPE_F32) {
+            ggml_backend_tensor_get(nce, null_cond_vec.data(), 0, (size_t) emb_n * sizeof(float));
+        } else {
+            fprintf(stderr, "[ace-train] WARNING: null_condition_emb unexpected type %d, CFG dropout disabled\n",
+                    (int) nce->type);
+            null_cond_vec.clear();
+        }
+    }
+    bool have_cfg_dropout = !null_cond_vec.empty() && a.cfg_ratio > 0.0f;
+    fprintf(stderr, "[ace-train] CFG dropout: %s (ratio=%.2f)\n", have_cfg_dropout ? "enabled" : "disabled",
+            a.cfg_ratio);
+
+    // Scratch buffer for a CFG-dropped sample's encoder_hidden: null_cond_vec
+    // (one H_enc-sized vector) tiled across every encoder position.
+    std::vector<float> null_enc_hidden;
 
     int64_t global_step  = 0;
     double  ema_loss      = -1.0;
@@ -255,11 +329,22 @@ static int run_fit(const char * prog, int argc, char ** argv) {
                 for (float & v : noise) {
                     v = noise_dist(data_rng);
                 }
-                float t_val = DIT_TRAIN_TURBO_SHIFT3_TIMESTEPS[t_idx_dist(data_rng)];
+                float t_val = sample_t(data_rng);
+
+                const float * enc_hidden_data = s.encoder_hidden.data();
+                if (have_cfg_dropout && cfg_dropout_dist(data_rng) < a.cfg_ratio) {
+                    int64_t H_enc = (int64_t) s.encoder_hidden.size() / s.enc_S;
+                    null_enc_hidden.resize((size_t) H_enc * s.enc_S);
+                    for (int j = 0; j < s.enc_S; j++) {
+                        memcpy(&null_enc_hidden[(size_t) j * H_enc], null_cond_vec.data(),
+                               (size_t) H_enc * sizeof(float));
+                    }
+                    enc_hidden_data = null_enc_hidden.data();
+                }
 
                 float loss = dit_train_forward_backward(&trainer, s.T, s.enc_S, s.target_latents.data(),
-                                                        s.context_latents.data(), s.encoder_hidden.data(),
-                                                        noise.data(), t_val);
+                                                        s.context_latents.data(), enc_hidden_data, noise.data(),
+                                                        t_val);
                 batch_loss += loss;
                 batch_n++;
             }
@@ -287,7 +372,7 @@ static int run_fit(const char * prog, int argc, char ** argv) {
                 for (float & v : noise) {
                     v = noise_dist(data_rng);
                 }
-                float t_val = DIT_TRAIN_TURBO_SHIFT3_TIMESTEPS[t_idx_dist(data_rng)];
+                float t_val = sample_t(data_rng);
                 val_loss += dit_train_eval(&trainer, s.T, s.enc_S, s.target_latents.data(), s.context_latents.data(),
                                           s.encoder_hidden.data(), noise.data(), t_val);
             }
@@ -324,6 +409,8 @@ struct PrepareArgs {
     int         vae_chunk     = 1024;
     int         vae_overlap   = 64;
     bool        skip_existing = false;
+    std::string trigger_word;
+    std::string tag_position = "prepend";
 };
 
 static void usage_prepare(const char * prog) {
@@ -340,6 +427,16 @@ static void usage_prepare(const char * prog) {
             "Auto-labeling:\n"
             "  --lm-model <name>       LM GGUF filename; fills captions missing from sidecars\n"
             "                          (samples with no caption and no --lm-model are skipped)\n"
+            "\n"
+            "Trigger word (recommended for style/single-song adapters -- see TRAINING_DEV.md):\n"
+            "  --trigger-word <word>   Short tag applied to every sample's caption, so the whole\n"
+            "                          training set shares one reliably invokable hook instead of\n"
+            "                          relying on each sample's own long natural-language caption.\n"
+            "                          Include it in the caption at inference time to invoke the\n"
+            "                          adapter's learned concept.\n"
+            "  --tag-position <mode>   prepend | append | replace (default: prepend). 'replace'\n"
+            "                          drops the per-sample caption entirely (auto-label is\n"
+            "                          skipped too) -- the trigger word IS the whole prompt.\n"
             "\n"
             "Options:\n"
             "  --dit-model <name>      DiT GGUF filename (default: first DiT found)\n"
@@ -385,6 +482,10 @@ static int run_prepare(const char * prog, int argc, char ** argv) {
             a.vae_overlap = atoi(need("--vae-overlap"));
         } else if (arg == "--skip-existing") {
             a.skip_existing = true;
+        } else if (arg == "--trigger-word") {
+            a.trigger_word = need("--trigger-word");
+        } else if (arg == "--tag-position") {
+            a.tag_position = need("--tag-position");
         } else if (arg == "-h" || arg == "--help") {
             usage_prepare(prog);
             return 0;
@@ -398,6 +499,11 @@ static int run_prepare(const char * prog, int argc, char ** argv) {
     if (a.models_dir.empty() || a.dataset_dir.empty() || a.output_dir.empty()) {
         fprintf(stderr, "[ace-train] FATAL: --models, --dataset and --output are all required\n");
         usage_prepare(prog);
+        return 1;
+    }
+    if (a.tag_position != "prepend" && a.tag_position != "append" && a.tag_position != "replace") {
+        fprintf(stderr, "[ace-train] FATAL: --tag-position must be prepend, append or replace (got '%s')\n",
+                a.tag_position.c_str());
         return 1;
     }
 
@@ -432,6 +538,8 @@ static int run_prepare(const char * prog, int argc, char ** argv) {
     params.vae_chunk      = a.vae_chunk;
     params.vae_overlap    = a.vae_overlap;
     params.max_duration   = a.max_duration;
+    params.custom_tag     = a.trigger_word;
+    params.tag_position   = a.tag_position;
 
     std::string lm_path;
     if (!a.lm_model.empty()) {
@@ -450,6 +558,12 @@ static int run_prepare(const char * prog, int argc, char ** argv) {
     fprintf(stderr, "[ace-train] VAE: %s\n", params.vae_path.c_str());
     fprintf(stderr, "[ace-train] Auto-label LM: %s\n", lm_path.empty() ? "(none -- captions must come from sidecars)"
                                                                       : lm_path.c_str());
+    if (!a.trigger_word.empty()) {
+        fprintf(stderr, "[ace-train] Trigger word: \"%s\" (%s) -- include this in the caption at inference time\n",
+                a.trigger_word.c_str(), a.tag_position.c_str());
+    } else {
+        fprintf(stderr, "[ace-train] Trigger word: (none -- each sample's own caption used verbatim)\n");
+    }
 
     std::vector<DiTPrepareLabel> labels = dit_prepare_scan_dataset(a.dataset_dir);
     if (labels.empty()) {

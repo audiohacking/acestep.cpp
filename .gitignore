@@ -2,6 +2,8 @@ build/
 *.wav
 *.bf16
 
+/tmp/
+
 tests/*/
 
 checkpoints/

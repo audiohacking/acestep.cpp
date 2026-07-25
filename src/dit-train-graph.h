@@ -1,8 +1,25 @@
 #pragma once
-// dit-graph.h: DiT compute graph construction (ggml)
+// dit-train-graph.h: DiT compute graph construction for TRAINING ONLY.
 //
-// Graph builders: timestep embedding, self-attention, cross-attention,
-// MLP, per-layer composition, and full N-step diffusion graph.
+// Deliberately a self-contained fork of src/dit-graph.h's forward-pass
+// builders, not a shared/parameterized extension of it. src/dit-graph.h is
+// the same graph-building code the production generation path
+// (src/dit-sampler.h, used by ace-lm/ace-synth/ace-server) depends on; this
+// file exists so that `ace-train`'s LoRA/backward/bf16-precision/diagnostic
+// additions never need to touch that shared file at all. The tradeoff,
+// deliberately accepted: this file's non-LoRA architecture code (timestep
+// embedding, self/cross-attention, MLP, per-layer composition) must be kept
+// in sync BY HAND with src/dit-graph.h if the underlying DiT architecture
+// ever changes there. Only `ace-train` (src/dit-train.h) and the diagnostic
+// tool (tests/test-grad-compare.cpp) include this file; production inference
+// never does.
+//
+// Never included from the same translation unit as src/dit-graph.h --
+// both define same-named static helpers (dit_ggml_f32, dit_ggml_linear,
+// dit_ggml_build_layer, dit_ggml_build_graph, ...); combining them in one
+// .cpp would be a redefinition error. Today's include graph keeps this
+// invariant: dit-sampler.h (-> dit-graph.h) and dit-train.h (-> this file)
+// are never both included by the same file.
 //
 // ggml tensor layout reminder:
 //   [S, H] in math = ne[0]=H, ne[1]=S in ggml
@@ -75,6 +92,64 @@ static struct ggml_tensor * dit_ggml_gated_add(struct ggml_context * ctx,
     return ggml_add(ctx, residual, gated);
 }
 
+// ---- LoRA training support -------------------------------------------------
+//
+// A tensor: ggml ne=(in_feat, rank)  (PyTorch row major [rank, in_feat])
+// B tensor: ggml ne=(rank, out_feat) (PyTorch row major [out_feat, rank])
+// delta = scaling * B @ (A @ x), scaling = alpha / rank. Only valid on the
+// "all separate" QKV/GateUp code paths: fused-weight inference paths never
+// apply here (this file is training-only; the fused-weight inference graph
+// lives entirely in src/dit-graph.h and never sees a LoRA bundle).
+struct DiTLoraProj {
+    struct ggml_tensor * A       = nullptr;
+    struct ggml_tensor * B       = nullptr;
+    float                scaling = 1.0f;
+};
+
+struct DiTLoraLayer {
+    DiTLoraProj sa_q, sa_k, sa_v, sa_o;
+    DiTLoraProj ca_q, ca_k, ca_v, ca_o;
+};
+
+// When true, the LoRA branch's matmul operands are rounded to BF16
+// precision (staying F32-typed) immediately before each matmul, mirroring
+// PyTorch autocast's "cast operands to bf16, accumulate/output in f32"
+// behavior for the trainable LoRA A/B matmuls under Python's bf16-mixed
+// trainer. Forward-only rounding; backward is a straight-through estimator
+// (see ggml_bf16_rtne). Off by default -- src/dit-train.h sets it true only
+// around its own forward/backward and eval graph builds.
+static bool g_dit_train_bf16_lora = false;
+
+static struct ggml_tensor * dit_ggml_bf16_rtne_maybe(struct ggml_context * ctx, struct ggml_tensor * t) {
+    return g_dit_train_bf16_lora ? ggml_bf16_rtne(ctx, t) : t;
+}
+
+// When true, marks a handful of intermediate tensors (self/cross-attn
+// sub-components on layers 0-3, plus every layer's post-block hidden state)
+// as named graph outputs, for tests/test-grad-compare.cpp's layer-by-layer
+// backward-pass diagnostics against Python. Off by default; only the
+// diagnostic tool sets it.
+static bool g_dit_debug_layer_dumps = false;
+
+static struct ggml_tensor * dit_lora_delta(struct ggml_context * ctx, const DiTLoraProj * lp, struct ggml_tensor * x) {
+    if (!lp || !lp->A || !lp->B) {
+        return nullptr;
+    }
+    struct ggml_tensor * xr = dit_ggml_bf16_rtne_maybe(ctx, x);
+    struct ggml_tensor * Ar = dit_ggml_bf16_rtne_maybe(ctx, lp->A);
+    struct ggml_tensor * h  = dit_ggml_linear(ctx, Ar, xr);  // [rank, S, N]
+    struct ggml_tensor * hr = dit_ggml_bf16_rtne_maybe(ctx, h);
+    struct ggml_tensor * Br = dit_ggml_bf16_rtne_maybe(ctx, lp->B);
+    struct ggml_tensor * d  = dit_ggml_linear(ctx, Br, hr);  // [out_feat, S, N]
+    return ggml_scale(ctx, d, lp->scaling);
+}
+
+static struct ggml_tensor * dit_ggml_add_lora(struct ggml_context * ctx,
+                                              struct ggml_tensor *  base,
+                                              struct ggml_tensor *  delta) {
+    return delta ? ggml_add(ctx, base, delta) : base;
+}
+
 // Build timestep embedding subgraph
 // t_scalar: [1] f32, returns temb [H] and *out_tproj [6H]
 // suffix: "_t" or "_r" for naming intermediate tensors
@@ -145,7 +220,8 @@ static struct ggml_tensor * dit_ggml_build_self_attn(
     struct ggml_tensor *  mask,       // [S, S] or NULL (sliding window mask)
     int                   S,
     int                   N,
-    int                   layer_idx = -1) {
+    int                   layer_idx  = -1,
+    const DiTLoraLayer *  lora       = nullptr) {
     DiTGGMLConfig & c   = m->cfg;
     int             D   = c.head_dim;
     int             Nh  = c.n_heads;
@@ -170,6 +246,11 @@ static struct ggml_tensor * dit_ggml_build_self_attn(
         q = dit_ggml_linear(ctx, ly->sa_q_proj, norm_sa);
         k = dit_ggml_linear(ctx, ly->sa_k_proj, norm_sa);
         v = dit_ggml_linear(ctx, ly->sa_v_proj, norm_sa);
+        if (lora) {
+            q = dit_ggml_add_lora(ctx, q, dit_lora_delta(ctx, &lora->sa_q, norm_sa));
+            k = dit_ggml_add_lora(ctx, k, dit_lora_delta(ctx, &lora->sa_k, norm_sa));
+            v = dit_ggml_add_lora(ctx, v, dit_lora_delta(ctx, &lora->sa_v, norm_sa));
+        }
     }
 
     // 2) Reshape to heads: [Nh*D, S, N] -> [D, Nh, S, N]
@@ -210,7 +291,7 @@ static struct ggml_tensor * dit_ggml_build_self_attn(
     v = ggml_permute(ctx, v, 0, 2, 1, 3);
 
     // 7) Attention (flash on GPU, F32 manual on CPU)
-    //    Q[D, S, Nh, N], K[D, S, Nkv, N], V[D, S, Nkv, N]
+    //    Q[D, S, Nh, N], K[D, S_kv, Nkv, N], V[D, S_kv, Nkv, N]
     float scale = 1.0f / sqrtf((float) D);
 
     // K/V come in F32 from mul_mat (no KV cache here). Cast to F16 before FA,
@@ -241,6 +322,9 @@ static struct ggml_tensor * dit_ggml_build_self_attn(
 
     // 8) O projection: [Nh*D, S, N] -> [H, S, N]
     struct ggml_tensor * out = dit_ggml_linear(ctx, ly->sa_o_proj, attn);
+    if (lora) {
+        out = dit_ggml_add_lora(ctx, out, dit_lora_delta(ctx, &lora->sa_o, attn));
+    }
     return out;
 }
 
@@ -281,7 +365,9 @@ static struct ggml_tensor * dit_ggml_build_cross_attn(struct ggml_context * ctx,
                                                       struct ggml_tensor *  mask,       // [enc_S, S, 1, N] F16 or NULL
                                                       int                   S,
                                                       int                   enc_S,
-                                                      int                   N) {
+                                                      int                   N,
+                                                      int                   layer_idx = -1,
+                                                      const DiTLoraLayer *  lora = nullptr) {
     DiTGGMLConfig & c   = m->cfg;
     int             D   = c.head_dim;
     int             Nh  = c.n_heads;
@@ -312,7 +398,27 @@ static struct ggml_tensor * dit_ggml_build_cross_attn(struct ggml_context * ctx,
         q = dit_ggml_linear(ctx, ly->ca_q_proj, norm_ca);
         k = dit_ggml_linear(ctx, ly->ca_k_proj, enc);
         v = dit_ggml_linear(ctx, ly->ca_v_proj, enc);
+        if (lora) {
+            q = dit_ggml_add_lora(ctx, q, dit_lora_delta(ctx, &lora->ca_q, norm_ca));
+            k = dit_ggml_add_lora(ctx, k, dit_lora_delta(ctx, &lora->ca_k, enc));
+            v = dit_ggml_add_lora(ctx, v, dit_lora_delta(ctx, &lora->ca_v, enc));
+        }
     }
+
+    // Sub-step debug dumps (layers 0-3), matching
+    // tmp/grad-compare-sub/isolate_cross_attn.py's Python-side granularity
+    // for localizing the cross-attention backward divergence found there.
+    bool dbg_ca = g_dit_debug_layer_dumps && (layer_idx == 0 || layer_idx == 1 || layer_idx == 2 || layer_idx == 3);
+    char dbgname_ca[64];
+    auto dbg_ca_out = [&](struct ggml_tensor * t, const char * suffix) {
+        if (!dbg_ca) return;
+        snprintf(dbgname_ca, sizeof(dbgname_ca), "layer%d_ca_%s", layer_idx, suffix);
+        ggml_set_name(t, dbgname_ca);
+        ggml_set_output(t);
+    };
+    dbg_ca_out(q, "q_proj_out");
+    dbg_ca_out(k, "k_proj_out");
+    dbg_ca_out(v, "v_proj_out");
 
     // reshape to [D, heads, seq, N] then permute to [D, seq, heads, N]
     q = ggml_reshape_4d(ctx, q, D, Nh, S, N);
@@ -329,6 +435,10 @@ static struct ggml_tensor * dit_ggml_build_cross_attn(struct ggml_context * ctx,
     q = ggml_mul(ctx, q, dit_ggml_f32(ctx, ly->ca_q_norm));
     k = ggml_rms_norm(ctx, k, c.rms_norm_eps);
     k = ggml_mul(ctx, k, dit_ggml_f32(ctx, ly->ca_k_norm));
+
+    dbg_ca_out(q, "query_states");
+    dbg_ca_out(k, "key_states");
+    dbg_ca_out(v, "value_states");
 
     // no RoPE for cross-attention
     // mask blocks padding positions in encoder hidden states
@@ -350,12 +460,18 @@ static struct ggml_tensor * dit_ggml_build_cross_attn(struct ggml_context * ctx,
     if (m->use_flash_attn) {
         ggml_flash_attn_ext_set_prec(attn, GGML_PREC_F32);
     }
+    dbg_ca_out(attn, "attn_out_raw");
 
     // Attention output: [D, Nh, S, N], reshape to [H, S, N]
     attn = ggml_reshape_3d(ctx, attn, Nh * D, S, N);
+    dbg_ca_out(attn, "attn_out_reshaped");
 
     // O projection
-    return dit_ggml_linear(ctx, ly->ca_o_proj, attn);
+    struct ggml_tensor * out = dit_ggml_linear(ctx, ly->ca_o_proj, attn);
+    if (lora) {
+        out = dit_ggml_add_lora(ctx, out, dit_lora_delta(ctx, &lora->ca_o, attn));
+    }
+    return out;
 }
 
 // Build one full DiT layer (AdaLN + self-attn + cross-attn + FFN + gated residuals)
@@ -375,7 +491,8 @@ static struct ggml_tensor * dit_ggml_build_layer(struct ggml_context * ctx,
                                                  struct ggml_tensor *  ca_mask,    // [enc_S, S, 1, N] or NULL
                                                  int                   S,
                                                  int                   enc_S,
-                                                 int                   N) {
+                                                 int                   N,
+                                                 const DiTLoraLayer *  lora = nullptr) {
     DiTGGMLConfig & c  = m->cfg;
     DiTGGMLLayer *  ly = &m->layers[layer_idx];
     int             H  = c.hidden_size;
@@ -404,50 +521,59 @@ static struct ggml_tensor * dit_ggml_build_layer(struct ggml_context * ctx,
     struct ggml_tensor * norm_sa  = dit_ggml_rms_norm_weighted(ctx, hidden, ly->self_attn_norm, c.rms_norm_eps);
     norm_sa                       = dit_ggml_adaln(ctx, norm_sa, scale_sa, shift_sa, m->scalar_one);
 
-    if (layer_idx == 0) {
-        ggml_set_name(norm_sa, "layer0_sa_input");
-        ggml_set_output(norm_sa);
-    }
+    // Sub-component debug dumps for a few early layers (where the sharpest
+    // backward-pass divergence against Python was localized -- see
+    // TRAINING_DEV.md). ggml_set_output is enough for forward-value dumps;
+    // callers doing backward-pass diagnostics must ALSO mark that specific
+    // tensor's *gradient* as an output (ggml_graph_get_grad + ggml_set_output
+    // on the result) before ggml_gallocr_alloc_graph runs, or the allocator
+    // is free to recycle the buffer before it's read back -- see
+    // tests/test-grad-compare.cpp's dit_train_forward_backward_layer_grads.
+    bool dbg_layer = g_dit_debug_layer_dumps && (layer_idx == 0 || layer_idx == 1 || layer_idx == 2 || layer_idx == 3);
+    char dbgname[64];
+    auto dbg_out = [&](struct ggml_tensor * t, const char * suffix) {
+        if (!dbg_layer) return;
+        snprintf(dbgname, sizeof(dbgname), "layer%d_%s", layer_idx, suffix);
+        ggml_set_name(t, dbgname);
+        ggml_set_output(t);
+    };
+
+    dbg_out(norm_sa, "sa_input");
 
     // sa_mask is pre-selected by the caller (sliding window for layer_type=0, NULL for layer_type=1)
-    struct ggml_tensor * sa_out = dit_ggml_build_self_attn(ctx, m, ly, norm_sa, positions, sa_mask, S, N, layer_idx);
+    struct ggml_tensor * sa_out =
+        dit_ggml_build_self_attn(ctx, m, ly, norm_sa, positions, sa_mask, S, N, layer_idx, lora);
 
-    if (layer_idx == 0) {
-        ggml_set_name(sa_out, "layer0_sa_output");
-        ggml_set_output(sa_out);
-    }
+    dbg_out(sa_out, "sa_output");
 
     hidden = dit_ggml_gated_add(ctx, residual, sa_out, gate_sa);
 
-    if (layer_idx == 0) {
-        ggml_set_name(hidden, "layer0_after_self_attn");
-        ggml_set_output(hidden);
-    }
+    dbg_out(hidden, "after_self_attn");
 
     // Cross-attention (no gate, simple residual add)
     if (enc) {
         struct ggml_tensor * norm_ca = dit_ggml_rms_norm_weighted(ctx, hidden, ly->cross_attn_norm, c.rms_norm_eps);
+        dbg_out(norm_ca, "norm_ca");
         struct ggml_tensor * ca_out =
-            dit_ggml_build_cross_attn(ctx, m, ly, norm_ca, enc, positions, ca_mask, S, enc_S, N);
+            dit_ggml_build_cross_attn(ctx, m, ly, norm_ca, enc, positions, ca_mask, S, enc_S, N, layer_idx, lora);
+        dbg_out(ca_out, "ca_output");
         hidden = ggml_add(ctx, hidden, ca_out);
     }
 
-    if (layer_idx == 0) {
-        ggml_set_name(hidden, "layer0_after_cross_attn");
-        ggml_set_output(hidden);
-    }
+    dbg_out(hidden, "after_cross_attn");
 
     // FFN with AdaLN + gated residual
     residual                      = hidden;
     struct ggml_tensor * norm_ffn = dit_ggml_rms_norm_weighted(ctx, hidden, ly->mlp_norm, c.rms_norm_eps);
     norm_ffn                      = dit_ggml_adaln(ctx, norm_ffn, scale_ffn, shift_ffn, m->scalar_one);
     struct ggml_tensor * ffn_out  = dit_ggml_build_mlp(ctx, m, ly, norm_ffn, S);
+    dbg_out(ffn_out, "ffn_output");
     hidden                        = dit_ggml_gated_add(ctx, residual, ffn_out, gate_ffn);
 
     return hidden;
 }
 
-// Build the full DiT forward graph (all layers).
+// Build the full DiT forward graph (all layers), training variant.
 // Returns the final output tensor (velocity prediction).
 // N = batch size (number of samples to denoise in parallel).
 //
@@ -462,20 +588,26 @@ static struct ggml_tensor * dit_ggml_build_layer(struct ggml_context * ctx,
 //
 // Graph outputs:
 //   "velocity"        [out_channels, T, N]  predicted flow velocity
-static struct ggml_cgraph * dit_ggml_build_graph(DiTGGML *             m,
-                                                 struct ggml_context * ctx,
-                                                 int                   T,           // temporal length (before patching)
-                                                 int                   enc_S,       // encoder sequence length
-                                                 int                   N,           // batch size
-                                                 struct ggml_tensor ** p_input,     // [out] input tensor to fill
-                                                 struct ggml_tensor ** p_output) {  // [out] output tensor to read
+static struct ggml_cgraph * dit_ggml_build_graph(
+    DiTGGML *             m,
+    struct ggml_context * ctx,
+    int                   T,                        // temporal length (before patching)
+    int                   enc_S,                     // encoder sequence length
+    int                   N,                          // batch size
+    struct ggml_tensor ** p_input,                    // [out] input tensor to fill
+    struct ggml_tensor ** p_output,                    // [out] output tensor to read
+    const DiTLoraLayer *  lora_layers = nullptr,        // [in] per-layer LoRA bundle array, or NULL
+    bool                  want_grads  = false) {         // [in] allocate the graph with gradient support
 
     DiTGGMLConfig & c = m->cfg;
     int             S = T / c.patch_size;  // sequence length after patching
     int             H = c.hidden_size;
     int             P = c.patch_size;
 
-    struct ggml_cgraph * gf = ggml_new_graph_custom(ctx, 8192, false);
+    // Backward roughly doubles node count vs forward, plus per-parameter
+    // optimizer step nodes appended by the caller (src/dit-train.h).
+    size_t                graph_size = want_grads ? 32768 : 8192;
+    struct ggml_cgraph * gf         = ggml_new_graph_custom(ctx, graph_size, want_grads);
 
     // Inputs
 
@@ -573,9 +705,15 @@ static struct ggml_cgraph * dit_ggml_build_graph(DiTGGML *             m,
     for (int i = 0; i < c.n_layers; i++) {
         // layer_type=0 (sliding window): sa_mask_sw, layer_type=1 (full): unmasked
         struct ggml_tensor * sa_mask = (m->layers[i].layer_type == 0) ? sa_mask_sw : nullptr;
-        hidden = dit_ggml_build_layer(ctx, m, i, hidden, tproj, enc, positions, sa_mask, ca_mask, S, enc_S, N);
-        // Debug dumps at key layers: 0, 6, 12, 18, last
-        if (i == 0 || i == 6 || i == 12 || i == 18 || i == c.n_layers - 1) {
+        const DiTLoraLayer * lora    = lora_layers ? &lora_layers[i] : nullptr;
+        hidden = dit_ggml_build_layer(ctx, m, i, hidden, tproj, enc, positions, sa_mask, ca_mask, S, enc_S, N, lora);
+        // Debug dumps at every layer boundary (named + kept as a graph output
+        // so callers can read its value and, when the graph has grads
+        // (dit_ggml_build_graph's want_grads=true), its gradient via
+        // ggml_graph_get_grad -- used for the layer-by-layer backward-pass
+        // localization in tests/test-grad-compare.cpp). Gated: see
+        // g_dit_debug_layer_dumps.
+        if (g_dit_debug_layer_dumps) {
             char lname[64];
             snprintf(lname, sizeof(lname), "hidden_after_layer%d", i);
             ggml_set_name(hidden, lname);

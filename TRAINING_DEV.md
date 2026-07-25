@@ -131,7 +131,12 @@ dir. Both implemented (Phase 3: `fit`, Phase 4: `prepare`):
     --models models \
     --dataset  path/to/audio_dir \        # .wav/.mp3 (+optional sidecars)
     --output   path/to/tensors_dir \      # per-sample GGUF
-    --lm-model acestep-5Hz-lm-4B-Q8_0.gguf  # optional, auto-labels missing captions
+    --lm-model acestep-5Hz-lm-4B-Q8_0.gguf \ # optional, auto-labels missing captions
+    --trigger-word mystyle01 --tag-position prepend  # optional, see Phase 5 below
+
+# At inference, invoke it through ace-lm with use_cot_caption:false so the
+# LM's Phase 1 CoT doesn't rewrite the (possibly unrecognized) trigger word
+# before it reaches the DiT -- see Phase 5's Decisions log entry.
 
 # 2) Training
 ./ace-train fit \
@@ -316,10 +321,221 @@ zeroes the accumulator. Cheap regardless of `grad_accum`: the graph is
   and padding the tail with `silence_latent` frames, exactly mirroring how
   `ops_resolve_T` already does this for `--src-audio` at inference time
   (`src/pipeline-synth-ops.cpp:330`).
-- [ ] **Phase 5 — end-to-end validation**
+- [~] **Phase 5 — end-to-end validation** (in progress)
   Train a small-style LoRA on 10–20 songs; A/B the adapter in ace-synth /
   WebUI vs base model; compare loss curves against the Python trainer on the
   same dataset (both start from the same BF16 turbo DiT).
+  Step 1 (single-song sanity check) done: fit 300 epochs on one real
+  70s breakbeat track (`grad-accum=1`, no val-split — overfitting one real
+  song on purpose, to isolate "does the pipeline learn from real audio at
+  all" from "does it generalize across a diverse set"). EMA loss dropped
+  1.29 → 0.70 over the run (noisy, as expected — real training resamples
+  noise + a discrete timestep every pass, unlike Phase 2's fixed-target
+  overfit test, so this is not a clean monotone curve). Real GPU throughput
+  at production-scale T (~1500 latent frames, 60s audio): ~1s/optimizer
+  step uncontended. A/B rendered from the same LM-generated codes/seed
+  through both the base model and the trained adapter (scale 1.0);
+  confirmed genuinely different output (`md5sum` differs, adapter reports
+  192/192 tensors merged) and handed both tracks to the user to judge by
+  ear — model can't self-assess audio quality, only mechanical correctness.
+  One workflow mistake caught immediately: `ace-synth --adapters <dir>`
+  does nothing unless the request JSON itself carries `"adapter": "<name>"`
+  — an LM-generated request has no such field by default, so the very
+  first "with adapter" render silently ran as base (identical file size,
+  caught by comparing hashes). Not a bug in `ace-synth` (this matches
+  documented behavior, README's Adapters section: "Select the active
+  adapter" is a per-request field, not a directory-presence toggle) —
+  purely an operator error worth flagging for anyone scripting A/B
+  comparisons the same way.
+  A wider 14-song diverse-style run was also started (300 epochs,
+  grad-accum=2, val-split 0.15, ~1h50m projected) to test a real multi-song
+  dataset, but stopped partway (at epoch ~155/300, EMA ~0.87, best val-loss
+  0.826) in favor of the cleaner single-song check first — GPU contention
+  between the two concurrent jobs was part of the reasoning. Revisit with
+  a deliberately curated set once the single-song result is confirmed
+  good by ear.
+  Step 2 (second single-song check, `sample-A.mp3`, no
+  sidecars) surfaced a real process failure, not a mechanism bug: auto-label
+  hallucinated the caption as "dreamy, atmospheric... chillwave or ambient
+  electronic music" for a track the user describes as an epic house
+  track with powerful distorted bass and heavy sidechain pumping — the
+  LM got the genre completely backwards. That wrong caption then drove
+  *both* training's text conditioning (paired against the real house-track
+  audio in `target_latents` — a contradictory training signal) *and* the
+  A/B generation (both renders asked for chillwave, so of course both
+  sounded like chillwave, regardless of what the LoRA learned from the
+  audio side). This is the single-file re-run of the exact hallucination
+  risk already noted for an earlier test clip in Phase 4's
+  progress log, except that time nobody used the bad caption for anything
+  downstream, so it went unnoticed. **Lesson**: never treat an auto-labeled
+  caption as ground truth without a sanity check — a human glance at the
+  caption before training (or before using it for A/B generation) would
+  have caught this immediately. Fixed by writing a corrected `.json`
+  sidecar by hand and re-running `prepare` (confirmed via the log: no
+  "Auto-labeled" line this time, meaning the sidecar caption was used
+  directly) and `fit`. Also spot-checked the first run's trained LoRA
+  delta magnitude directly from the safetensors (layer 0 self_attn.q_proj:
+  `lora_A` norm 2.87 / max 0.098, `lora_B` norm 0.148 / max 0.0055) — small
+  but clearly non-degenerate, consistent with "the adapter learned
+  *something* from 300 steps, it was just conditioned on a caption that
+  contradicted the audio it was aligned with." Re-run with the corrected
+  caption in progress.
+  Step 3: user raised a real methodology gap while the corrected re-run was
+  in progress — a *long descriptive caption* is not how you reliably
+  invoke a trained concept; you want a short, consistent **trigger word**
+  every training sample shares, so the adapter learns one dependable hook
+  instead of the model having to re-derive "the training distribution"
+  from a differently-worded caption every time. Checked: acestep-repo
+  already has exactly this (`AudioSample.custom_tag` +
+  `DatasetMetadata.tag_position`, `get_full_caption()` in `models.py`) —
+  our `ace-train prepare` had no equivalent at all until now. Added
+  `--trigger-word` / `--tag-position` (prepend/append/replace, prepend
+  default, matching Python) to `ace-train prepare`; implemented as
+  `dit_prepare_apply_tag()` in `src/dit-prepare.h`, byte-for-byte the same
+  string-building logic as `get_full_caption()`. In `replace` mode,
+  auto-labeling is skipped entirely (the trigger word is the whole prompt
+  regardless of caption, so there's nothing for the LM to contribute and
+  no hallucination risk to import). Re-running the sample-A training
+  with `--trigger-word acetrig01 --tag-position prepend` layered on top of
+  the corrected caption, to test whether the short trigger word alone (no
+  long description needed) reliably invokes the learned qualities at
+  inference — that's the actual open question, not yet answered.
+  Trained (EMA 1.40 → 0.91). Testing it surfaced a *third* real
+  operational gap, this time in how `ace-lm` is invoked, not in
+  `ace-train`: sending `{"caption": "acetrig01", "lyrics": ""}` through
+  `ace-lm` triggers Phase 1 CoT (per `docs/ARCHITECTURE.md`'s "Caption
+  only" mode), which **freely rewrites** an unrecognized short caption
+  into something else entirely — one run turned `"acetrig01"` into "A
+  clean, nylon-string acoustic guitar plays a gentle, arpeggiated chord
+  progression..." before it ever reached the DiT's text encoder. The
+  trigger word never made it into the conditioning at all; that render
+  was meaningless as a test. Fix: set `"lyrics": "[Instrumental]"` (so
+  Phase 1 isn't in free-caption-generation mode) and
+  `"use_cot_caption": false` (so even the CoT pass that still runs to fill
+  missing bpm/keyscale/etc. leaves the caption text untouched — verified
+  the resulting `request0.json` has `"caption": "acetrig01"` byte for
+  byte). **Anyone using a trigger word through the full ace-lm → ace-synth
+  pipeline needs `use_cot_caption: false`**, or the trigger word is at the
+  mercy of the LM's caption-enrichment step and may not survive to reach
+  the model at all. Re-ran the A/B with this fix.
+  User's verdict on that A/B: base and adapter were "basically the same"
+  and neither resembled the reference track at all — a real signal that
+  something is fundamentally off, not just "needs more training." Went
+  back to the Python reference (`acestep-repo`) specifically for how it
+  applies a trained LoRA at inference and validates it, rather than keep
+  guessing. Findings (see full research notes; key facts below):
+  - **The Python reference never merges LoRA into a quantized checkpoint,
+    and explicitly refuses to.** LoRA is applied as a *dynamic* PEFT wrapper
+    (`peft.PeftModel.from_pretrained`, `.../lora/lifecycle.py:191-272`) kept
+    separate from the base weights at inference; quantized models are
+    rejected outright with `"❌ LoRA loading is not supported on quantized
+    models"` (same file, ~line 200). Training itself also refuses
+    torchao-quantized decoders. A `merge_and_unload()` path exists
+    (`training/lora_utils.py`) but is an export-only utility, not part of
+    the generation path. There is no "dequantize base, add delta,
+    requantize" workflow anywhere in that codebase — acestep.cpp's
+    adapter-merge path (necessary for a static-merge, zero-runtime-overhead
+    design, and normally fine for a *well-trained* adapter) is the only
+    place doing this, and it's now a live suspect.
+  - **LoRA scale**: their UI defaults to and clamps to 1.0 ("full
+    strength") — confirms `adapter_scale=1.0` was the right value to test
+    with; this isn't a scale-convention mismatch.
+  - **Epoch guidance**: their own docs recommend 200-500 epochs for
+    1-10 songs (`docs/sidestep/Training Guide.md`), 800 for a 10-20 song
+    style set. Our single-song runs used 300 *steps* (grad-accum=1, so
+    steps==epochs here) — in range for their low end, not obviously too
+    short, though "epoch" in their multi-song runs means one full pass
+    with grad-accum=4, i.e. more actual gradient updates per epoch than
+    our single-sample runs get per step. No source found stating a
+    specific "minimum epochs before any audible effect" threshold.
+  - Wrote a quantitative diagnostic (`tests/diag-quant-erasure.cpp`, ad hoc,
+    not wired into the build) that runs the *real* trained checkpoint
+    through the *real* `adapter_merge()` against the *real* Q8_0 DiT and
+    compares dequantized merged vs. original weights directly. Result on 5
+    real projections: the merge does change real bytes (not a no-op:
+    63-96% of bytes came out byte-identical, meaning 4-37% changed), but
+    the changes are tiny — **mean |delta| / mean |base weight| ranged
+    0.12% to 1.05% across layers 0/12/23**. That is a very small
+    perturbation in absolute terms, on top of which quantization rounds
+    away part of an already-small signal. Two compounding causes, not one:
+    (1) 300 steps at lr=1e-4 on a single 60s clip is producing a genuinely
+    faint weight shift — likely underpowered regardless of quantization;
+    (2) merging into Q8_0 (which the Python reference never does at all)
+    coarsens that already-faint signal further.
+  - Ran one more diagnostic: `adapter_scale=20.0` (20x the Python
+    reference's own max) on the *same* trained checkpoint, no retraining,
+    to check whether the learned direction is real but just too weak at
+    scale=1, or genuinely absent. Rendered and handed to the user alongside
+    the corrected-caption/trigger-word A/B for a perceptual verdict on all
+    three.
+  - **Recommended next steps** (not yet acted on, pending the scale=20
+    listening result): (a) train substantially harder before drawing
+    conclusions — more steps and/or a higher learning rate, since Python's
+    own epoch guidance implies far more gradient updates than our
+    single-song runs have used so far; (b) treat quantized-model LoRA
+    merging as a real fidelity risk the way the Python reference does —
+    either warn/require an unquantized (BF16) DiT for `--adapters` the way
+    they refuse quantized models outright, or keep it but document the
+    expected precision loss; (c) don't judge "does the mechanism work" from
+    a single 300-step/rank-8/one-song run again — use a stronger run as the
+    baseline for any future A/B.
+  User pushed back on the amplification line of investigation (scale=3/5/20
+  all reported as "just noise") and gave a crucial data point: **their own
+  past Python-pipeline experiment training on one song did work** — not
+  stylistically, but as a near-literal copy, confirming single-song
+  "memorization" is achievable on this architecture when done right. That
+  ruled out "single-song reproduction is an unrealistic ask" as an
+  explanation and pointed the investigation back at *our* pipeline
+  specifically diverging from Python's, not at the technique itself.
+  Re-read `docs/en/LoRA_Training_Tutorial.md` in full (previously only
+  summarized) and cross-checked a second, independent Python reference
+  the user pointed at,
+  [ComfyUI-FL-AceStep-Training](https://github.com/filliptm/ComfyUI-FL-AceStep-Training)
+  (cloned to `../ComfyUI-FL-AceStep-Training`), for an exact parameter and
+  pipeline comparison:
+  - **Hyperparameters match exactly** across all three implementations
+    (ours, acestep-repo, ComfyUI-FL): rank=8, alpha=16, target_modules
+    q/k/v/o_proj, lr=1e-4, AdamW + warmup/cosine, turbo discrete
+    shift=3.0 8-timestep schedule, MSE flow-matching loss
+    (`xt = t*x1+(1-t)*x0`, target `x1-x0`). No hyperparameter bug found.
+  - **Training duration is the one place we're clearly out of range.**
+    ComfyUI-FL's own `max_epochs` slider goes up to 10,000 (default 100);
+    the tutorial's own disclaimer demo used 500 epochs — on a 13-song
+    album, not one song, but still far more optimizer steps in aggregate
+    than our 300. Nothing we tested so far has gone past low hundreds of
+    steps on a single sample.
+  - **Two more real divergences found**, both in dataset encoding
+    (`src/dit-prepare.h`), both traced back to an earlier deliberate
+    choice to match ace-synth's *inference* convention instead of the
+    Python *trainer's* convention:
+    1. Lyrics: we were wrapping as
+       `"# Languages\n{lang}\n\n# Lyric\n{lyrics}<|endoftext|>"` before
+       tokenizing (matches ace-synth inference). Both acestep-repo
+       (`preprocess_lyrics.py`) and ComfyUI-FL
+       (`comfy_wrappers.py::embed_tokens`) tokenize **raw, completely
+       unwrapped** lyrics text, `embed_tokens` only, max_length=512 — no
+       wrapper of any kind. Two independent references agree; ours didn't
+       match either.
+    2. CondEncoder timbre placeholder: we were feeding one frame of the
+       DiT's real `silence_latent` (matches ace-synth inference).
+       acestep-repo's `run_encoder` and ComfyUI-FL's
+       `_get_refer_audio_tensors` both use a literal
+       `torch.zeros(1, 1, 64)` dummy for training. (The **context_latents**
+       src channels — silence + mask=1 for text2music — were never in
+       question: both Python references and ace-synth all agree those use
+       the real silence_latent; only the *timbre* placeholder differed.)
+  - Given the user now explicitly wants exact Python-pipeline replication
+    rather than ace-synth-inference-consistency, **reverted both**:
+    lyrics are now tokenized raw/unwrapped, and the timbre placeholder is
+    now a zero vector, matching both Python references byte-for-byte. This
+    supersedes the earlier Phase 4/5 decisions to do the opposite; if a
+    production LoRA later needs ace-synth-inference-matched conditioning
+    instead, that's a deliberate follow-up, not the default.
+  - Re-ran `prepare` (confirmed via log) and launched a much longer `fit`
+    run — 3000 steps (vs. 300 before) on the corrected encoding, closer to
+    the ecosystem's actual typical scale — to test the "just needed way
+    more training, on the right encoding" hypothesis properly. In progress;
+    see Progress log for the outcome once it lands.
 - [ ] **Phase 6 — polish / stretch**
   Server endpoints (`/training/*`) + WebUI tab, SSE progress; LoRA dropout
   via philox mask; gradient checkpointing; BF16 out_prod fork patch;
@@ -518,6 +734,714 @@ zeroes the accumulator. Cheap regardless of `grad_accum`: the graph is
 - [ ] prepare-stage tensors match Python preprocessed .pt (cossim) on the
       same real sample (would need a working acestep-megalora preprocess
       run to compare against — not yet done)
-- [ ] Trained LoRA audibly shifts style in ace-synth output on a real
-      multi-song style dataset (Phase 5: today's real-audio runs used 1-3
-      songs purely to validate the pipeline mechanics, not style transfer)
+- [~] Trained LoRA audibly shifts style in ace-synth output: single-song
+      (one real track, 300 epochs) A/B rendered and handed to the user for
+      listening judgment — mechanically confirmed different output,
+      perceptual verdict pending. Multi-song style dataset not yet done.
+
+## Perf: per-step GPU idle gaps in `ace-train fit` (fixed)
+
+User noticed `nvidia-smi dmon` showing the GPU alternating ~96% / ~0%
+utilization in a multi-second cycle during a long single-song run (3000
+steps, grad-accum=1), rather than staying busy. Root cause, found in
+`src/dit-train.h`: `dit_train_forward_backward`, `dit_train_eval`, and
+`dit_train_optimizer_step` each built a fresh `StaticGraph` (i.e.
+`ggml_gallocr_new` -> `alloc_graph` -> `ggml_gallocr_free`) on *every
+call*, i.e. up to 3x per training step. `ggml_gallocr_free` triggers a
+real `ggml_backend_buffer_free` (cudaFree) and the next `ggml_gallocr_new`
++ `alloc_graph` forces a fresh reservation (cudaMalloc) since there's no
+previous allocation to compare against — two full alloc/free round trips
+per step, serializing the CUDA driver and showing up as idle GPU gaps.
+
+Fix: `ggml_gallocr` is designed to be created once and reused across many
+`alloc_graph` calls on different (but same-shape) graphs —
+`ggml_gallocr_alloc_graph` only reallocates when the incoming graph's
+node/leaf count or tensor shapes actually differ from what's already
+reserved (`ggml_gallocr_needs_realloc` in `ggml-alloc.c`); otherwise it's
+just a cheap bookkeeping reset. Added three persistent `ggml_gallocr_t`
+handles to `DiTTrain` (`fwd_galloc`, `eval_galloc`, `opt_galloc`), created
+once in `dit_train_init`, freed once in `dit_train_free`, and reused
+directly in place of the old per-call `StaticGraph`. Since every step
+trains the same sample (same T) and the optimizer-step graph's topology
+never changes, this eliminates essentially all per-step
+cudaMalloc/cudaFree calls after the first step.
+
+Verified:
+- `tests/test-lora-train-smoke.cpp` still PASSes (loss curve identical:
+  1.776807 -> 0.753187 over 60 steps, same as before the change) —
+  confirms the reuse doesn't change training semantics.
+- `tests/test-lora-roundtrip.cpp` still PASSes (192/192 tensors, cossim
+  0.999982) — confirms checkpoint format/content unaffected.
+- Steady-state throughput on the real single-song dataset went from
+  ~0.49-0.53 s/step to ~0.31 s/step (~40-45% faster wall-clock).
+- `nvidia-smi dmon` during a fresh run now shows sustained 70-96% SM
+  utilization with no idle gaps, vs. the previous 96%/0% alternation.
+
+This was pure infra overhead; it doesn't change any of the perceptual/
+under-training investigation above. `static-graph.h`'s `StaticGraph`
+helper itself is untouched and still used as-is by the (already one-shot,
+non-looping) inference call sites in `src/qwen3-lm.h` and
+`src/dit-sampler.h` — out of scope here.
+
+## Metadata conditioning (bpm/keyscale/timesignature)
+
+Training encodes these directly into the DiT's Metas text block
+(`dit_build_prompt_strings` in `dit-prompt.h`; `bpm<=0` renders as
+literal `"N/A"`). They must be **non-placeholder and identical** at
+train and generation time:
+
+- `dit_prepare_encode_sample()` only auto-labels (fills bpm/keyscale/
+  timesignature/caption from `ace-understand`) when `label.caption` is
+  empty (`dit-prepare.h`, "Auto-label if caption is missing" gate). A
+  sidecar with its own caption but `bpm: 0` stays at `0` -- never write
+  a caption without also supplying the real bpm/keyscale/timesignature.
+- At generation, `ace-lm`'s Phase 1 (`metadata-fsm.h`) gap-fills only
+  fields the request left empty. Set `bpm`/`keyscale`/`timesignature`/
+  `vocal_language` explicitly in the request to the exact training
+  values -- otherwise the LM substitutes its own guess.
+- `ace-understand`'s LM-based bpm/key detection is unreliable for
+  precise numeric estimation (measured miss: guessed bpm=71/key=C#minor
+  vs. confirmed true bpm=126/key=F minor on a full untruncated track) --
+  treat as a draft, verify by ear or DSP (see Essentia below), never
+  trust blindly.
+
+## Essentia integration: DSP-based bpm/key detection
+
+Vendored [Essentia](https://essentia.upf.edu/) (MTG, AGPL-3.0) as a git
+submodule (`vendor/essentia`) for DSP-based tempo/key analysis
+(`RhythmExtractor2013`, `KeyExtractor`) to replace the LM's unreliable
+numeric-metadata guesses.
+
+**Build**: `waf` (Essentia's own build), wired into CMake via
+`add_custom_command`/`add_custom_target` (`essentia_build`) ->
+`libessentia.a`, wrapped as an `IMPORTED` target linked **only** into
+`ace-train` and `ace-understand` directly -- **not** into `acestep-core`.
+`acestep-core` is the static library shared by every binary (`ace-synth`,
+`ace-lm`, `ace-server` too); this project is MIT-licensed, and Essentia is
+AGPL-3.0, so linking it into the shared library would carry AGPL's
+copyleft obligations onto binaries that never call into it. Verified with
+`nm -C` on the built binaries, not just by reading the CMake file: zero
+Essentia symbols in `ace-synth`/`ace-lm`/`ace-server`, present (as
+expected) in `ace-train`/`ace-understand`. Lightweight mode (`--lightweight=fftw,yaml
+--build-static`): FFTW3 + libyaml only, no FFmpeg/libsamplerate/TagLib/
+Gaia2/TensorFlow (we do our own decode+resample and don't need file I/O
+or ML classifiers). Builds on ARM64 (NVIDIA GB10) with
+`libeigen3-dev`/`libfftw3-dev`/`libyaml-dev` from apt, ~52s for 294
+translation units.
+
+**API**: `src/audio-analysis.h`.
+- `audio_analyze_bpm_key_buf()` -- low-level, pre-decoded buffer + rate.
+- `audio_analyze_bpm_key_from_file()` -- use this one. Decodes at the
+  file's **native** rate, resamples once directly to 44100 Hz
+  (`RhythmExtractor2013` hardcodes an internal 44100 Hz assumption).
+  Resampling from an already-48kHz-resampled buffer (native->48k->44.1k,
+  two lowpass passes) measurably degrades tempo tracking: 126.0 exact
+  vs. 144.6 on the same confirmed-bpm=126 track. Always feed it the
+  original file path, not a buffer the rest of the pipeline already
+  resampled.
+
+**Call sites** (fill gaps only, never override an explicit value):
+- `tools/ace-understand.cpp`: overrides `out.bpm`/`out.keyscale` after
+  `ace_understand_generate()` returns.
+- `dit-prepare.h`'s `dit_prepare_encode_sample()` (step 2b): runs
+  whenever `label.bpm <= 0 || label.keyscale.empty()`, decoupled from
+  the caption-empty auto-label gate above it (Essentia doesn't need a
+  caption to run).
+
+**Verified**: matches confirmed ground truth (bpm=126, key=F minor)
+exactly on a real track. `test-lora-roundtrip`/`test-lora-train-smoke`/
+`test-model-store` still PASS.
+
+## Training timestep distribution: continuous, not discrete
+
+`src/dit-train.h` / `tools/ace-train.cpp`. Timestep sampling:
+`t = sigmoid(N(mu=-0.4, sigma=1.0))`, drawn fresh every step, identical
+for turbo/base/sft. Not the turbo inference schedule's 8 discrete
+shift=3.0 values (`DIT_TRAIN_TURBO_SHIFT3_TIMESTEPS`, kept only for
+`tests/test-lora-train-smoke.cpp`'s fixed-t overfit mechanism check).
+"shift" is inference-schedule-only, never applied during training.
+Source: `acestep-repo`'s `train.py` ships this as its `fixed` mode,
+documented as reimplementing `sample_t_r()` from the model's own
+`modeling_acestep_v15_turbo.py`.
+
+CFG dropout: `--cfg-ratio` (default 0.15). With that probability, a
+step's real conditioning is replaced by the model's own
+`null_condition_emb` (already loaded for inference-time CFG, tiled
+across every encoder position for training). Without it the LoRA never
+sees the unconditional branch real CFG-guided generation evaluates.
+
+Verified: `test-lora-train-smoke`/`test-lora-roundtrip` PASS unchanged.
+
+## LoRA rank/alpha: 64/128, not 8/16
+
+`acestep-repo`'s `train.py fixed` CLI defaults to `--rank 64 --alpha
+128` (current recommended values in `training_v2`; rank=8/alpha=16
+matches older docs/ComfyUI-FL and is superseded). At rank=8/alpha=16
+with the corrected timestep+CFG-dropout recipe: no audible resemblance
+at adapter_scale=1.0. At rank=64/alpha=128, same recipe: audible
+resemblance at scale=1.0. Rank was necessary in addition to the
+timestep/CFG fix -- rank=8 lacks capacity for the harder, more diverse
+continuous-timestep+CFG-dropout objective (which itself converges to a
+higher loss floor than the old discrete-schedule regime; this reflects
+task difficulty, not regression).
+
+Overtraining at rank=64 is fast and must be checked by ear, not by loss
+alone: single ~75s sample, 3000-step cosine schedule (save every
+250-500 steps to compare cheaply without retraining). One sample's
+sweep: EMA~0.21 (good) -> EMA~0.10 ("drifting") -> EMA~0.06 ("obsessive"
+/low quality). Sweet spot is roughly EMA 0.15-0.25 for this
+duration/rank -- content-dependent, not a fixed step count.
+
+Step count does not transfer across content directly: setting
+`--epochs N` recalibrates the entire cosine LR schedule to decay by
+step N. Comparing checkpoints from runs with *different* `--epochs`
+budgets at the same step number is invalid (an early-decay run can look
+"converged" at a step where its LR has already floored, while a
+longer-budget run is still learning at that same step). Always compare
+checkpoints against loss level and position in a consistently-scheduled
+cosine curve, and use the same `--epochs` budget across content unless
+you've confirmed a shorter one doesn't cut the LR schedule short.
+
+## Generation flow: always `ace-lm` -> `ace-synth`
+
+The standard, documented generation path (`docs/ARCHITECTURE.md`,
+`README.md`) is always two-step: `ace-lm` generates real audio codes
+from the caption, `ace-synth` renders them -- including for adapters
+(README's worked example: a named external ComfyUI LoRA through this
+exact flow). Skipping `ace-lm` and hand-setting `audio_codes: ""`
+(pure text2music/silence context) is a different, non-standard path and
+measurably lower quality; do not use it for LoRA A/B testing.
+
+Training's `context_latents` are always silence+all-ones-mask
+(text2music convention, `dit-prepare.h`) regardless of what generation
+uses. This train/generation context difference exists but is not fatal
+to LoRA quality in practice -- externally-trained community LoRAs work
+fine through the standard `ace-lm` -> `ace-synth` flow despite it.
+
+## GGML `ggml_mul_mat_set_prec(GGML_PREC_F32)`: no effect on this model
+
+Investigated as a fix for small forward-pass drift vs PyTorch (temb's
+`linear_1` output: cos=0.99998 vs Python). Verified via runtime dispatch
+instrumentation in `ggml-cuda.cu` and source inspection, not guessing:
+
+- Quantized weights (Q8_0, the actual production `synth_model`) dispatch
+  to `ggml_cuda_mul_mat_q`/`ggml_cuda_mul_mat_vec_q`. Grepped
+  `mmq.cu`/`mmq.cuh`/`mmvq.cu`/`mmvq.cuh` for `prec`/`GGML_PREC`/
+  `op_params`: zero matches. These kernels never read the precision
+  hint -- it is a no-op for every quantized matmul in the model.
+- F32-weighted layers (temb) already default to F32 compute
+  (`compute_type = src0->type`, and `src0` is F32 there), so forcing
+  F32 changes nothing there either.
+- The remaining ~cos 0.99-0.9998 per-layer drift vs Python is ordinary
+  floating-point cross-implementation noise (different reduction
+  order), not a bug -- confirmed by it being equally or more present in
+  the no-adapter base case, which sounds correct.
+
+`dit_ggml_linear`/`dit_ggml_linear_bias` do not set this precision hint.
+Do not re-add it without first confirming (via dispatch logging, not
+assumption) which CUDA kernel a given matmul shape/dtype actually hits.
+
+## Gradient clipping: required at real sequence lengths
+
+`dit_train_optimizer_step` (`src/dit-train.h`) now clips the *global*
+L2 gradient norm across every LoRA tensor jointly, before the AdamW
+step -- matches `torch.nn.utils.clip_grad_norm_`, which the Python
+trainer applies via `--max-grad-norm` (default 1.0). New config field
+`DiTTrainConfig::max_grad_norm` (default 1.0, matches Python; 0
+disables), CLI flag `--max-grad-norm` in `ace-train fit`.
+
+This was previously completely absent -- no norm computation, no
+clipping, anywhere in the C++ trainer.
+
+**Symptom this fixes**: real training runs (single ~75s sample,
+matched hyperparameters/seed against the Python reference) showed EMA
+loss flat/noisy around 0.85-1.05 for 1000 steps with no downward trend,
+while Python's reference run on the identical sample/config/seed
+dropped 0.84 -> 0.10 over the same 1000 steps.
+
+**Isolated reproduction** (`test-lora-train-smoke --T <N> --enc-s <N>`,
+fixed single (t, noise) target, no data/CFG/timestep-sampling variables
+at all): overfit to near-zero loss at T=32/128/384 (small, synthetic
+scale). At T=1872 (real 75s-sample scale) loss plateaus/oscillates
+around 0.8-1.2 and never converges, even given far more steps than the
+small-T cases needed. Confirms the instability is scale-dependent (T,
+i.e. more attention positions contributing to the summed MSE loss and
+its gradient), not data- or sampling-related, and reproduces outside
+any real dataset. With clipping added, the same T=1872 fixed-target
+test trends steadily downward instead of plateauing.
+
+Diagnostic technique worth reusing: `test-lora-train-smoke`'s
+fixed-target overfit isolates optimizer/gradient-flow correctness from
+data and random-sampling variables, and its `--T`/`--enc-s` flags let
+you reproduce scale-dependent issues without a real dataset.
+
+## Reference audio for A/B comparisons lives in `/tmp/music`
+
+Real training/reference tracks (e.g. `sasac_-_*`, `david_rubato_-_circuit.mp3`)
+are in `/tmp/music`, not anywhere under `acestep-repo` or this repo's
+`tmp/`. Files that *look* like preserved generation outputs elsewhere
+(e.g. `acestep-repo/pytest_workspace/generated/*.mp3`) are not
+verified ground truth just because their filename is plausible --
+confirm what produced them before treating them as a reference.
+
+## Python's `generate_music()`: `audio_codes` forces "cover" task
+
+Passing `audio_codes` (used all session for deterministic forward-pass
+numerical comparisons, since it removes the LM/codec sampling variable)
+silently reassigns `task_type` to `"cover"` internally regardless of
+the requested `task_type` -- heavily conditions generation on
+reproducing that fixed reference's own structure. This is not the same
+generation mode as judging whether a LoRA's *style* comes through.
+For A/B-listening whether a LoRA learned anything, use plain
+`text2music` with no `audio_codes` (generate from scratch, guided only
+by caption/lyrics/metadata) -- that is what "does this LoRA sound like
+the reference" claims are actually based on.
+
+## Timestep sampling: `t = max` of two draws, not one
+
+Python's `sample_timesteps()` (`training_v2/timestep_sampling.py`) draws
+TWO independent `sigmoid(N(mu=-0.4, sigma=1.0))` samples per step and
+assigns `t=max, r=min` -- then forces `r=t` anyway via
+`data_proportion=1.0` (`use_meanflow=False` for every ACE-Step variant
+during training). Net effect: `r` is discarded, but `t` itself is the
+max of two draws, which is a different distribution than one draw
+(skews higher on average). `tools/ace-train.cpp`'s `sample_t` now
+matches this exactly (draws two, takes max) instead of a single draw.
+
+## LoRA-A init: PEFT's `kaiming_uniform_(a=sqrt(5))`, not `N(0, 1/sqrt(fan_in))`
+
+Verified via PEFT source (`peft/tuners/lora/layer.py`,
+`reset_lora_parameters`): default init is
+`nn.init.kaiming_uniform_(lora_A.weight, a=math.sqrt(5))`. For a Linear
+weight this reduces algebraically to `Uniform(-1/sqrt(fan_in),
+1/sqrt(fan_in))` (gain=sqrt(2/(1+5))=sqrt(1/3), bound=sqrt(3)*gain/sqrt(fan_in),
+and sqrt(3)*sqrt(1/3)=1 cancels). The Gaussian `N(0, 1/sqrt(fan_in))`
+used previously has ~1.73x (sqrt(3)x) the standard deviation of PEFT's
+actual init. `dit_train_alloc_proj` (`src/dit-train.h`) now draws
+Uniform to match exactly. B stays zero-init either way (both agree).
+
+## Gradient clipping + timestep fix + init fix: measured effect
+
+Same single ~75s sample, matched hyperparameters/seed as Python,
+comparing EMA loss at each of Python's own logged checkpoints:
+
+| step | Python | ours: no fixes | ours: +clip | ours: +clip+timestep+init |
+|------|--------|-----------------|--------------|------------------------------|
+| 250  | 0.844  | ~0.95 (flat)     | 0.939        | 0.939 |
+| 500  | 0.537  | ~0.95 (flat)     | 0.777        | 0.705 |
+| 750  | 0.369  | ~0.83 (flat)     | 0.592        | 0.616 |
+| 1000 | 0.099  | 0.888            | 0.613        | 0.556 |
+
+Gradient clipping is the dominant fix (flat -> steadily decreasing).
+Timestep/init fixes are real (verified via source, see above) but
+contribute less at this step count. A real gap to Python's step-1000
+value remains at this schedule length -- see next section for why, and
+why it is not a blocker.
+
+## Cross-language single-step gradient comparison: real, characterized, not step-count-fixable
+
+`tests/test-grad-compare.cpp` dumps a single training step's LoRA
+gradient (real sample, fixed LoRA A/B init + noise/t, exported to raw
+files) for cross-checking against Python's actual
+`FixedLoRAModule.training_step()` computing the identical step
+(`tmp/grad-compare/compare.py`). Findings, all via direct measurement:
+
+- Forward pass matches closely everywhere tested: loss values agree to
+  ~5 decimal places, at every layer depth and every data configuration
+  below.
+- Small-magnitude data (any T, any enc_S, including the real sample's
+  exact T=1876/enc_S=109 dimensions with *synthetic* small values):
+  final-layer LoRA gradient cos_sim = 0.96-0.999.
+- Real data (actual VAE-encoded latents + actual conditioning, values
+  up to +-59): final-layer (layer0, closest to the LoRA) gradient
+  cos_sim = 0.04-0.05 -- effectively uncorrelated.
+- Per-layer trace on the full 24-layer model (`--dump-layer-grads`,
+  `tmp/grad-compare-layers/compare_layers.py`, gradient hooks +
+  `retain_grad()` on every layer): cos_sim is 0.9995 at layer23 (last
+  layer, closest to the loss) and degrades smoothly backward through
+  the stack to 0.047 at layer0 -- a compounding accumulation through
+  24 layers of backward propagation, not a single localized bug at one
+  layer. (An earlier claim of a hard break at "layer index 3" was a
+  methodology artifact of capping the model to N layers, which changes
+  the architecture each time since the real output needs all 24 layers
+  plus the final AdaLN+proj_out stage -- retracted.)
+- Ruled out via direct experiment, not reasoning: PyTorch `eager` vs
+  `sdpa` attention implementation for the comparison (identical result,
+  rules out "different attention algorithm"); a buffer-reuse bug in the
+  *diagnostic tool itself* (found and fixed -- `ggml_set_output` must be
+  called on the gradient tensor, not just the forward tensor, or the
+  allocator recycles its buffer before it's read back); GGML's softmax
+  backward reduction accumulating in `float` instead of `double`
+  (`ggml-cuda/softmax.cu`, `ggml-cpu/ops.cpp` -- patched to match
+  `ggml_rms_norm_back`'s existing double-precision convention as a
+  correctness improvement regardless, but it measured zero effect on
+  this specific divergence: 0.047071 vs 0.047192, noise-level).
+- Finite-difference verification (perturb a LoRA weight, compare
+  numerical vs analytic gradient) is unreliable at this gradient
+  magnitude (~1e-6): tested against a case with *known-good* cos_sim
+  (0.96+ at small-T) and it disagreed there just as badly as at real
+  scale, proving the check itself -- not the gradient -- is the
+  unreliable part at this magnitude in F32. Retracted as inconclusive.
+
+**Practical resolution**: this is real, measured, gradient-direction
+imprecision that compounds over the 24-layer stack when real
+(wide-dynamic-range) data is used, not (as far as every specific op's
+backward formula checked by direct source reading) a single fixable
+formula bug. AdamW is tolerant of gradient noise -- it just needs more
+steps to average it out. Confirmed empirically: the same single sample,
+same 3 fixes, run for 2500 epochs instead of 1000 (recalibrating the
+whole cosine schedule, per the step-count-doesn't-transfer note above)
+reaches EMA loss 0.115-0.160 by steps 2000-2500, in Python's own
+convergence range (Python's longer runs reached 0.069-0.075 around
+epochs 1500-1750). More steps, not a code fix, closes the remaining gap
+in practice.
+
+## Cross-attention "root cause" retracted: it was a test-harness bug
+
+An earlier pass of this investigation used isolated backward tests
+(seed Python's autograd with our own computed upstream gradient at a
+specific tensor, then check whether Python's backward reproduces our
+downstream gradient -- isolates one op/sub-step from everything else)
+and concluded the divergence was localized to cross-attention's core
+`Q@K^T -> softmax -> probs@V` computation, specifically via
+`ggml_out_prod` (the op `ggml_mul_mat`'s backward routes through) and
+its GQA-broadcast handling. Two double-precision patches were made
+against this theory (see below) and measured zero effect -- which,
+in hindsight, should have been the signal to question the localization
+itself rather than the precision hypothesis.
+
+**The actual bug**: the manual test scripts that reimplemented
+`AceStepDiTLayer.forward()`'s cross-attention stage by hand
+(`isolate_subcomponents.py`, `isolate_cross_attn.py`) fed the RAW
+condition-encoder output directly into `layer.cross_attn(...)`. Python's
+real model applies `self.condition_embedder` (a `Linear`, matching our
+own `cond_emb_w`/`cond_emb_b`) to this tensor exactly ONCE, at the top
+of `AceStepDiTModel.forward()`, before ever reaching a layer
+(`modeling_acestep_v15_turbo.py:1363`). Scripts that call individual
+layers/sub-modules directly (bypassing the model's own `forward()`)
+must apply this projection themselves; scripts that hook the model's
+real forward pass (`compare_layers.py`, `isolate_layer1.py`) get it for
+free and were never affected.
+
+**Verified fix and correction** (`tmp/grad-compare-fwd/check_forward_qkv.py`):
+applying `decoder.condition_embedder` correctly makes cross-attention's
+forward AND backward match near-perfectly:
+- `k_proj_out`/`v_proj_out` forward values: cos_sim 1.000000 (were
+  falsely 0.00/-0.06 -- a scale error of ~6x, from feeding
+  un-projected data into a projection-sized weight matrix).
+- Sub-component backward, corrected (`isolate_subcomponents.py`
+  re-run): cross-attention output cos_sim=0.999989 (was falsely
+  0.757); the real, modest divergence is in **self-attention's**
+  backward instead (0.9999 -> 0.906 crossing it), matching the
+  ~0.90-0.96 "steady-state" level seen throughout the 24-layer trace,
+  not a localized catastrophic failure anywhere.
+
+**Corrected conclusion**: there is no single identifiable formula bug.
+Every backward formula actually checked by direct source reading
+(softmax, RMSNorm, MUL_MAT/out_prod, the view/reshape/permute/transpose
+family) is mathematically correct. The double-precision changes to
+softmax's backward reduction (`ggml-cuda/softmax.cu`,
+`ggml-cpu/ops.cpp`) and the experimental double-precision `out_prod`
+path (`ggml-cuda/out-prod.cu`, gated behind `GGML_OUT_PROD_F64_ACCUM=1`,
+off by default) are kept as genuine correctness improvements matching
+`ggml_rms_norm_back`'s existing convention, but neither was "the fix"
+-- both were correctly measured as having no effect, because the
+localization that motivated them was itself wrong. The real
+divergence is a modest (~5-10%), not-yet-further-localized per-layer
+gradient-direction difference that compounds smoothly over the
+24-layer stack specifically when real (wide-dynamic-range) data is
+used -- ordinary cross-implementation floating-point behavior at this
+depth, not a bug found so far. AdamW tolerates it; more optimizer
+steps closes the gap in practice (see above, confirmed to Python's own
+convergence range at 2000-2500 steps).
+
+**Methodological lesson, worth keeping**: any test script that
+reimplements part of a model's forward pass by hand (rather than
+hooking the model's own `forward()`) must be checked line-by-line
+against the *entire* real forward path, including steps that happen
+once outside the immediate module being tested -- not just the
+module's own documented inputs/outputs. A script that "looks like" it
+reproduces one layer's computation can silently skip a shared,
+upstream projection and produce a confident, precisely-reproducible,
+false localization.
+
+## Python trains the LoRA in bf16, not f32 -- confirmed via source, not yet portable
+
+Read directly from `training_v2/trainer_fixed.py` (`FixedLoRATrainer`,
+the class `train.py fixed` actually instantiates -- confirmed via
+`cli/train_fixed.py`'s import, this is the real production path, not a
+dead code branch):
+
+- `self.module.model = self.module.model.to(self.module.dtype)`
+  (line 377) casts the **entire decoder, including LoRA A/B**, to
+  `self.module.dtype` -- `bf16` on CUDA (`_select_compute_dtype`).
+- Wrapped in `self.fabric.setup(...)` with Lightning Fabric's
+  `"bf16-mixed"` precision plugin.
+- Critically, `acestep/training/trainer.py` (the *older*, unused
+  trainer) has an explicit safety net missing here: it checks
+  `if device_type == "mps" or precision.endswith("-mixed")` and, in
+  that case, casts to **fp32** instead, then calls
+  `_ensure_trainable_params_fp32()` to force any bf16-drifted trainable
+  tensor back to fp32 before the optimizer touches it. `trainer_fixed.py`
+  has no such check and no equivalent call anywhere in `training_v2/`.
+- `fixed_lora_module.py`'s `training_step()` additionally wraps the
+  forward pass in `torch.autocast(dtype=bf16)`. PyTorch's autocast
+  policy (documented, not project-specific) casts matmul-family ops
+  (`linear`, `matmul`, `conv*`) to bf16 while automatically keeping
+  softmax/layer_norm/reductions in fp32 -- so the real per-op precision
+  split is "matmuls in bf16, norms in f32", not "everything bf16" or
+  "everything f32".
+
+Our C++ trainer runs matmuls, norms, and gradients entirely in F32.
+This is a real, source-confirmed precision mismatch against the actual
+production trainer (not the F32-forced Python used for every gradient
+comparison above, which was never representative of what `train.py
+fixed` actually runs) and is a more plausible dominant explanation for
+the residual per-layer gradient-direction gap than anything in the
+cross-attention/out_prod investigation.
+
+**Attempted fix, reverted -- hard architectural blockers found by
+building it, not by guessing**:
+
+1. Tried fake-quantizing activations/weights through a
+   `ggml_cast(F32->BF16->F32)` round-trip before every
+   `dit_ggml_linear`/`dit_ggml_linear_bias` matmul (gated to training
+   only via a flag, zero effect on inference). Assumed `ggml_cast`
+   needed a new backward case; it doesn't -- `ggml_cast` actually
+   builds a `GGML_OP_CPY` node (confirmed via `ggml_cast`'s source,
+   `ggml.c:3547`), and `GGML_OP_CPY` already has a working
+   straight-through-style backward. The wrong-opcode addition didn't
+   even compile and was removed.
+2. With that removed, the round-trip still **crashes**:
+   `ggml_build_backward_expand` asserts
+   `node->src[j]->type == GGML_TYPE_F32 || GGML_TYPE_F16` for every
+   node in the built backward graph (`ggml.c:7273`) -- BF16 is not an
+   accepted gradient dtype anywhere in this fork's autodiff, full stop.
+   Confirmed by running it, not by reading alone.
+3. The correct fix needs a value transform that rounds F32 data to
+   BF16 *precision* while staying F32-*typed* (so it never trips the
+   above assertion) -- i.e. a new elementwise op, since this isn't
+   expressible as arithmetic composition of existing ops (BF16
+   truncation is a bit-level operation, not a smooth function) and
+   `ggml_map_custom1` (GGML's generic escape hatch for arbitrary
+   elementwise C code) has neither a CUDA implementation nor a backward
+   case registered anywhere in this fork.
+4. `ggml_out_prod` (`MUL_MAT`'s backward) and `ggml_opt_step_adamw`
+   both hard-assert F32 for every operand on both CPU and CUDA --
+   confirmed via source in both `ggml-cpu` and `ggml-cuda`. Neither
+   accepts BF16 today regardless of the above.
+
+**Status**: reverted rather than ship an unvalidated new core op
+(bit-level BF16 round-trip, CPU+CUDA kernels, backward wiring) touching
+shared dispatch tables used by every other op in the codebase, in the
+same session as everything else already changed. The concrete next
+step for genuine bf16-matmul parity is that new op -- forward: truncate
+an F32 value's mantissa to BF16 precision, stay F32-typed; backward:
+straight-through (gradient passes unchanged) -- plus wiring it into
+`dit_ggml_linear`/`dit_ggml_linear_bias` behind the training-only flag
+already scoped out above. This is additive (new op, existing behavior
+untouched) and should not require touching `ggml_out_prod` or
+`ggml_opt_step_adamw` at all, since the round-tripped tensor stays F32
+the whole time and both of those already accept F32.
+completely wrong localization.
+
+## Listening-test checkpoint: cpp vs python LoRA, same trigger/dataset
+
+Both trained on the same single-sample dataset (`acetrig01`, rank=64,
+alpha=128), both generated through each side's own real, unmodified
+pipeline (`ace-lm` -> `ace-synth` for cpp; `generate_music()` +
+`add_lora()`/PEFT for python) -- same caption, bpm, keyscale,
+timesignature, no shared/fixed audio codes, no cover-mode.
+
+User's verdict: outputs are similar; python's is a little higher
+quality. Consistent with the still-open bf16-matmul-training gap
+documented above (python trains matmuls in bf16 under autocast, cpp
+trains everything in F32) -- not yet re-diagnosed further, just noted
+as the leading candidate for the remaining gap.
+
+## `ggml_bf16_rtne`: bf16-precision matmul op, implemented
+
+Built the op scoped above instead of the full-tensor-dtype approach that
+crashed. New `GGML_UNARY_OP_BF16_RTNE` (`ggml.h`/`ggml.c`, CPU
+`unary-ops.cpp`+`ops.cpp`+`ggml-cpu.c`, CUDA `unary.cu`+`unary.cuh`+
+`ggml-cuda.cu`):
+
+- Forward: F32 value -> round-to-nearest-even to BF16 precision -> back to
+  F32 (same bit algorithm as `ggml_compute_fp32_to_bf16`, reimplemented
+  `__device__`-side for CUDA via `__float_as_uint`/`__uint_as_float` since
+  the host `static inline` version isn't callable from device code).
+  Tensor stays F32-typed throughout, so it never touches
+  `ggml_build_backward_expand`'s F32/F16-only assertion, `ggml_out_prod`,
+  or `ggml_opt_step_adamw` -- all three still see plain F32.
+- Backward: straight-through estimator, `ggml_add_or_set(isrc0, grad)`
+  (rounding's true derivative is zero a.e.; STE passes it through
+  unchanged, standard QAT practice).
+
+Wired into `dit_lora_delta` (`src/dit-graph.h`) only -- the LoRA A/B
+branch's own matmuls (`x`, `A`, hidden `h`, `B` all rounded immediately
+before each `dit_ggml_linear` call), gated by a global
+`g_dit_train_bf16_lora` flag set true only around the graph-build calls
+in `dit_train_forward_backward`/`dit_train_eval`, false everywhere else
+(inference, adapter merge). Deliberately does NOT touch the frozen base
+weights' matmuls: those already load in their native GGUF dtype (BF16 for
+the main projection weights, confirmed earlier), so the base branch was
+never the F32 outlier -- only the trainable LoRA branch was.
+
+Retrained (rank=64, alpha=128, 1500 epochs, same single-sample dataset):
+EMA loss 0.377, matching the F32 run's 0.369 -- no NaN, no crash, no
+meaningful loss-curve regression from adding the rounding. Generated
+another cpp-vs-python comparison through each side's real pipeline;
+listening verdict pending.
+
+## Second-material test: `shook_official_-_papaya.mp3` (nu-disco, trigger `papayatrig01`)
+
+Repeated the full cpp-vs-python trained-LoRA comparison on a second,
+unrelated reference track (`/tmp/music`) to confirm the circuit-track
+result wasn't a fluke of that one sample. 75s excerpt (30s-105s),
+metadata (caption/bpm=122/keyscale=A minor/timesig=4) derived via our
+own `ace-understand` tool once and reused identically for both
+trainers' dataset sidecars, rank=64/alpha=128, 1500 epochs both sides.
+
+Two real environment/tooling issues hit and fixed along the way,
+neither specific to this repo's code:
+
+1. `acestep-repo/acestep/training/dataset_builder_modules/preprocess_audio.py`
+   called `torchaudio.load()` directly with no fallback; this
+   environment's `torchcodec` can't find any working ffmpeg
+   (`libavutil.so.56/57/59/60` all missing) and `torchaudio.load` no
+   longer has its own legacy backend, so every preprocess call raised
+   `RuntimeError: Could not load libtorchcodec`. Patched in a
+   soundfile-based fallback (mirroring the fallback already present
+   next door in `dataset_builder_modules/audio_io.py::get_audio_duration`,
+   so this is completing an existing pattern, not inventing one).
+2. `train.py fixed --preprocess ...` only preprocesses and exits (its
+   final log line literally says "You can now train with: ...") --
+   it does not chain into training even though `--dataset-dir`/
+   `--output-dir`/training hyperparams are accepted on the same
+   invocation. Preprocessing and training are two separate CLI calls.
+   Also: `train.py fixed` (without `--preprocess`) prints a parameter
+   summary and blocks on an interactive `Start training? [Y/n]`
+   prompt with no non-interactive flag -- needs `yes |` piped into
+   stdin for scripted/background runs.
+
+Both trainers converged cleanly (cpp EMA loss 0.139, python final-epoch
+loss 0.082), no NaN/crash on either side, on a track with a
+substantially different genre/BPM/key than the first test.
+
+## Why python's reported training loss number looks lower: not a bug, probably RNG variance
+
+User noticed python's final loss (0.082) is clearly lower than cpp's
+(0.139 EMA) at the same step count and asked why. Compared the two
+loss computations line-by-line before concluding anything:
+
+- `fixed_lora_module.py::training_step` (python):
+  `x1=randn_like(target)` (noise), `x0=target_latents` (data),
+  `xt = t*x1 + (1-t)*x0`, `flow = x1 - x0`,
+  `loss = F.mse_loss(v_pred, flow)` (mean over all elements).
+- `dit-train.h` (`dit_train_forward_backward`/`dit_train_eval`, cpp):
+  identical convention (`xt = t*x1+(1-t)*x0`, `target=x1-x0`,
+  `loss = sum((v_pred-target)^2) / nelements(v_pred)`, i.e. the same
+  mean reduction). Formulas match exactly; this is not a
+  reduction/scaling bug.
+
+But the two numbers being compared are NOT computed from the same
+data: every step draws its own fresh random noise `x1` and timestep
+`t` (`sample_timesteps`: `max(sigmoid(N(-0.4,1)), sigmoid(N(-0.4,1)))`),
+and cpp's RNG (`std::mt19937`) and python's (`torch`'s generator) are
+different algorithms -- same seed=42 does NOT produce the same
+sequence across them. So "loss at step 1500" (or its EMA) from each
+trainer is one point on two *different, independently-random*
+trajectories, not two measurements of the same thing. The
+flow-matching objective's per-step loss variance is itself
+timestep-dependent (steps landing near `t=1`, i.e. `xt`~pure noise,
+structurally carry different squared-error scale than steps near
+`t=0`, regardless of model quality) -- both logs show this directly:
+cpp's own per-step loss swings from ~0.08 to ~0.9 step to step late in
+training, on a single unchanging model. A single final-step (or even
+a 10-step-EMA) comparison between two independent random walks is
+mostly comparing noise to noise, not adapter quality.
+
+Consistent with this: immediately after seeing the loss numbers, a
+second listening round on the SAME two adapters had the user's
+verdict flip the other way (cpp sounded better than python on the
+first round's files). Loss curves from single-sample, highly
+stochastic per-step training are not a reliable proxy for perceptual
+adapter quality here -- listening is. Not chasing this further as a
+"cpp is worse" bug without more direct evidence (e.g. matching RNG
+streams for an apples-to-apples curve) than one final number.
+
+## Consolidation pass: fixed a real production-path leak, wrote the user tutorial
+
+Before writing a user-facing tutorial, audited every diagnostic addition
+from this development arc for whether it could affect ordinary generation
+(`ace-lm`/`ace-synth`/`ace-server`), not just training. Found one real leak:
+
+- `src/dit-graph.h`'s per-layer/per-sub-component debug dumps (`dbg_out`,
+  `dbg_ca_out`, and the `hidden_after_layer{N}` block added earlier this
+  arc for `tests/test-grad-compare.cpp`'s backward-pass localization) were
+  **unconditional** inside `dit_ggml_build_graph` -- the same function
+  `src/dit-sampler.h` calls for every real generation step. Every
+  `ace-synth` call was building dozens of extra named+`ggml_set_output`
+  tensors for layers 0-3 (plus one per layer for `hidden_after_layerN`)
+  that only the diagnostic tool ever reads. `ggml_set_output` pins a
+  tensor's buffer for the graph's lifetime, so this was a real (if
+  probably small at these tensor sizes) memory/allocator overhead added to
+  production inference by test-only code, not just visual clutter.
+- Fixed: added `g_dit_debug_layer_dumps` (default `false`), gating all
+  three sites; `tests/test-grad-compare.cpp` sets it `true` only around its
+  own `dit_ggml_build_graph` call. Rebuilt everything, confirmed a plain
+  `ace-lm`->`ace-synth` generation still runs clean with no behavior
+  change, and confirmed `test-grad-compare --dump-layer-grads` still finds
+  every tensor it needs with the flag on.
+
+Remaining training-only surface (`g_dit_train_bf16_lora`, the
+`ggml_bf16_rtne` op itself) was already correctly gated -- verified by
+grepping every call site, not assumed.
+
+Wrote [`docs/TRAINING.md`](docs/TRAINING.md): a practical, user-facing
+tutorial (prepare -> fit -> generate, recommended rank/alpha/epochs,
+trigger-word convention, the `audio_codes`-forces-cover gotcha, and a
+troubleshooting section) -- deliberately separate from this file, which
+stays a development log. Linked from `README.md`'s Adapters and Technical
+documentation sections.
+
+## Full split: `src/dit-graph.h` reverted to pristine, `src/dit-train-graph.h` added
+
+Follow-up request: don't patch acestep.cpp's own files for training at
+all, even the gated version above -- prefer duplication, since a shared
+file like `dit-graph.h` is exactly the kind of change an upstream project
+would be reluctant to take. Confirmed via git that every piece of
+LoRA/training code in `dit-graph.h` (the `DiTLoraProj`/`DiTLoraLayer`
+structs, `dit_lora_delta`, `dit_ggml_add_lora`, the `lora`/`lora_layers`
+parameters threaded through every builder, `want_grads`, and this
+session's `g_dit_train_bf16_lora`/`g_dit_debug_layer_dumps` flags) was
+100% added by this training branch -- `master`'s `dit-graph.h` has none of
+it. Also confirmed `src/dit-sampler.h` (the real generation path) calls
+`dit_ggml_build_graph` with **no** `lora_layers` argument at all --
+production adapters are applied by merging into GGUF weights at load time
+(`src/adapter-merge.h`), never through this graph-level mechanism. So none
+of it was load-bearing for generation in the first place.
+
+Action: moved the entire LoRA/bf16/debug-dump graph-building layer into a
+new, fully self-contained `src/dit-train-graph.h` (duplicates the
+non-LoRA architecture code too -- temb, self-attn, cross-attn, MLP,
+per-layer composition -- rather than including `dit-graph.h`), then
+`git checkout master -- src/dit-graph.h` to restore it byte-for-byte.
+Verified: `git diff master -- src/dit-graph.h` is empty; `grep` for
+`DiTLoraLayer`/`g_dit_train_bf16_lora`/`g_dit_debug_layer_dumps` outside
+`dit-train-graph.h`/`dit-train.h`/`test-grad-compare.cpp` finds nothing.
+Rebuilt everything; `ace-lm`->`ace-synth` smoke test, `test-lora-train-smoke`,
+and `test-grad-compare --dump-layer-grads` all still pass.
+
+`docs/TRAINING.md`'s design-note section rewritten to describe the new
+split accurately (was written for the gated-flag version, now stale within
+the same session).
+
+Known remaining coupling, flagged but not touched without direction:
+`tools/ace-understand.cpp` (general-purpose CLI, not training-exclusive)
+now also uses the new Essentia-based BPM/key correction
+(`src/audio-analysis.h`) -- a real improvement to that tool's own output,
+not training-specific machinery, so left as-is pending explicit
+direction. `CMakeLists.txt`/`tests/CMakeLists.txt` additions (registering
+the `ace-train` and `test-grad-compare` targets) are unavoidable build-system
+wiring for a new binary, not behavioral changes to existing code.

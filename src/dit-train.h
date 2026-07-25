@@ -4,11 +4,24 @@
 // cond encoder and LM stay frozen and are used solely for dataset
 // preprocessing (src/dit-train.h has nothing to do with that stage).
 //
-// Training recipe (matches the Python reference trainer):
-//   x0 = target_latents, x1 = noise, t drawn from the turbo shift=3.0
-//   discrete schedule, xt = t*x1 + (1-t)*x0, v_pred = DiT(xt, t, t_r=t, ...),
+// Training recipe (matches the Python reference's *corrected* trainer --
+// acestep-repo's `train.py fixed`, which reimplements the model's own
+// sample_t_r()/CFG-dropout from modeling_acestep_v15_turbo.py -- not the
+// discrete-timestep "vanilla" mode that repo's own CLI labels "(bugged)"
+// and which an earlier version of this file matched by mistake):
+//   x0 = target_latents, x1 = noise, t = max(sigmoid(N(mu=-0.4, sigma=1.0)),
+//   sigmoid(N(mu=-0.4, sigma=1.0))) -- max of TWO independent draws, matching
+//   Python's sample_timesteps() (which also draws an r and forces r=t via
+//   data_proportion=1.0; r is unused here since t_r=t always for this model)
+//   drawn fresh every step (continuous, NOT the turbo shift=3.0 discrete
+//   8-value inference schedule -- "shift" is inference-only, never applied
+//   during training), xt = t*x1 + (1-t)*x0, v_pred = DiT(xt, t, t_r=t, ...),
 //   loss = MSE(v_pred, x1 - x0). LoRA on q/k/v/o_proj (self_attn + cross_attn)
 //   at every layer, rank/alpha configurable, AdamW with bias-corrected LR.
+//   CFG dropout (tools/ace-train.cpp): with probability cfg_ratio (default
+//   0.15), a step's real conditioning is replaced with the model's own
+//   null_condition_emb, so the LoRA also learns the unconditional branch
+//   real CFG-guided generation evaluates. See TRAINING_DEV.md.
 //
 // Design: the frozen DiT backbone (src/dit.h) and the per-layer LoRA A/B +
 // AdamW momentum tensors both live in persistent WeightCtx-backed backend
@@ -21,10 +34,9 @@
 // tensors by parameter *identity* (one m/v pair per LoRA tensor, held in our
 // own struct) avoids that footgun.
 
-#include "dit-graph.h"
+#include "dit-train-graph.h"
 #include "ggml-alloc.h"
 #include "safetensors-write.h"
-#include "static-graph.h"
 
 #include <cmath>
 #include <cstdint>
@@ -35,8 +47,11 @@
 #include <string>
 #include <vector>
 
-// Turbo model shift=3.0 discrete timesteps (8 steps, same as inference).
-// Matches TURBO_SHIFT3_TIMESTEPS in the Python trainer.
+// Turbo model shift=3.0 discrete inference schedule (8 steps) -- NOT used
+// for real training (see the corrected continuous sampling in
+// tools/ace-train.cpp's run_fit). Kept only for tests/test-lora-train-smoke.cpp,
+// which deliberately overfits a single fixed t to smoke-test the training
+// mechanism itself, independent of the timestep-distribution question.
 static const float DIT_TRAIN_TURBO_SHIFT3_TIMESTEPS[8] = {
     1.0f, 0.9545454545454546f, 0.9f, 0.8333333333333334f, 0.75f, 0.6428571428571429f, 0.5f, 0.3f,
 };
@@ -49,6 +64,7 @@ struct DiTTrainConfig {
     float beta2         = 0.999f;
     float eps           = 1e-8f;
     float weight_decay  = 0.01f;
+    float max_grad_norm = 1.0f;  // 0 = disabled; matches Python trainer's default of 1.0
 };
 
 struct DiTTrainProjMomentum {
@@ -90,6 +106,21 @@ struct DiTTrain {
     WeightCtx                           lora_wctx;  // persistent backend buffer for lora + mom + adamw_params
     struct ggml_tensor *                adamw_params = nullptr;  // [7] F32: alpha,beta1,beta2,eps,wd,beta1h,beta2h
     int64_t                             adam_iter    = 0;
+
+    // Persistent graph allocators, reused across steps instead of being
+    // torn down and rebuilt every call. ggml_gallocr_alloc_graph() only
+    // does a real cudaMalloc when the incoming graph's node/leaf count or
+    // tensor shapes differ from what's already reserved (see
+    // ggml_gallocr_needs_realloc in ggml-alloc.c); for same-shape samples
+    // (the common case: a fixed T repeated every step, or a fixed-size
+    // optimizer-step graph that never changes) alloc_graph becomes a cheap
+    // bookkeeping reset instead of a cudaMalloc/cudaFree pair. Recreating
+    // the allocator every step (the previous approach) defeated that reuse
+    // and forced a fresh cudaMalloc+cudaFree twice per step, which shows up
+    // as the GPU alternating between ~100% and ~0% utilization.
+    ggml_gallocr_t fwd_galloc  = nullptr;  // dit_train_forward_backward's graph
+    ggml_gallocr_t eval_galloc = nullptr;  // dit_train_eval's graph
+    ggml_gallocr_t opt_galloc  = nullptr;  // dit_train_optimizer_step's graph
 };
 
 // Fixed order used everywhere the 8 self_attn/cross_attn q/k/v/o_proj
@@ -109,9 +140,19 @@ static const char * dit_train_proj_kind(int j) {
 }
 
 // Allocate one LoRA projection (A, B) + its AdamW momentum (A_m, A_v, B_m,
-// B_v) inside wctx. A ~ N(0, 1/sqrt(in_feat)) (breaks symmetry so B receives
-// a nonzero gradient on step 1), B = 0 (standard LoRA init: the adapter
-// starts as a no-op). Momentum starts at zero.
+// B_v) inside wctx. A ~ Uniform(-1/sqrt(in_feat), 1/sqrt(in_feat)) (breaks
+// symmetry so B receives a nonzero gradient on step 1), B = 0 (standard LoRA
+// init: the adapter starts as a no-op). Momentum starts at zero.
+//
+// A's distribution matches PEFT's default exactly (peft/tuners/lora/layer.py
+// reset_lora_parameters(): nn.init.kaiming_uniform_(lora_A.weight,
+// a=sqrt(5))). For a Linear weight this reduces algebraically to
+// Uniform(-1/sqrt(fan_in), 1/sqrt(fan_in)): kaiming_uniform_ computes
+// gain=sqrt(2/(1+a^2))=sqrt(1/3), std=gain/sqrt(fan_in), bound=sqrt(3)*std,
+// and sqrt(3)*sqrt(1/3)=1 cancels exactly. A previous version of this
+// function used a Gaussian N(0, 1/sqrt(in_feat)) instead, which has ~1.73x
+// (sqrt(3)x) the standard deviation of PEFT's actual init -- a real,
+// verified-via-source mismatch, not just a plausible-sounding alternative.
 static void dit_train_alloc_proj(WeightCtx *          wctx,
                                  DiTLoraProj *        lp,
                                  DiTTrainProjMomentum * mp,
@@ -134,8 +175,9 @@ static void dit_train_alloc_proj(WeightCtx *          wctx,
     size_t a_n = (size_t) in_feat * rank;
     size_t b_n = (size_t) out_feat * rank;
 
-    auto                             a_buf = std::make_unique<float[]>(a_n);
-    std::normal_distribution<float> dist(0.0f, 1.0f / std::sqrt((float) in_feat));
+    auto                              a_buf = std::make_unique<float[]>(a_n);
+    float                             bound = 1.0f / std::sqrt((float) in_feat);
+    std::uniform_real_distribution<float> dist(-bound, bound);
     for (size_t i = 0; i < a_n; i++) {
         a_buf[i] = dist(rng);
     }
@@ -228,6 +270,15 @@ static bool dit_train_init(DiTTrain *             t,
         return false;
     }
 
+    ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(t->dit.backend);
+    t->fwd_galloc                   = ggml_gallocr_new(buft);
+    t->eval_galloc                  = ggml_gallocr_new(buft);
+    t->opt_galloc                   = ggml_gallocr_new(buft);
+    if (!t->fwd_galloc || !t->eval_galloc || !t->opt_galloc) {
+        fprintf(stderr, "[Train] FATAL: failed to create persistent graph allocators\n");
+        return false;
+    }
+
     int64_t total_params = 0;
     for (int i = 0; i < n_layers; i++) {
         DiTLoraProj * projs[8] = DIT_TRAIN_PROJ_PTRS(t->lora[i]);
@@ -241,6 +292,15 @@ static bool dit_train_init(DiTTrain *             t,
 }
 
 static void dit_train_free(DiTTrain * t) {
+    if (t->fwd_galloc) {
+        ggml_gallocr_free(t->fwd_galloc);
+    }
+    if (t->eval_galloc) {
+        ggml_gallocr_free(t->eval_galloc);
+    }
+    if (t->opt_galloc) {
+        ggml_gallocr_free(t->opt_galloc);
+    }
     wctx_free(&t->lora_wctx);
     dit_ggml_free(&t->dit);
     *t = {};
@@ -288,8 +348,10 @@ static float dit_train_forward_backward(DiTTrain *   t,
 
     struct ggml_tensor * t_input  = nullptr;
     struct ggml_tensor * t_output = nullptr;
+    g_dit_train_bf16_lora = true;
     struct ggml_cgraph *  gf =
         dit_ggml_build_graph(&t->dit, ctx, T, enc_S, /*N=*/1, &t_input, &t_output, t->lora.data(), /*want_grads=*/true);
+    g_dit_train_bf16_lora = false;
 
     // Loss: MSE(v_pred, x1 - x0), mean over every element (matches the
     // Python trainer's F.mse_loss default reduction).
@@ -340,8 +402,7 @@ static float dit_train_forward_backward(DiTTrain *   t,
     struct ggml_tensor * t_sa_mask  = ggml_graph_get_tensor(gf, "sa_mask_sw");
     struct ggml_tensor * t_ca_mask  = ggml_graph_get_tensor(gf, "ca_mask");
 
-    StaticGraph sg;
-    if (!static_graph_alloc(&sg, t->dit.backend, t->dit.sched, gf)) {
+    if (!ggml_gallocr_alloc_graph(t->fwd_galloc, gf)) {
         fprintf(stderr, "[Train] FATAL: failed to allocate training graph\n");
         exit(1);
     }
@@ -404,7 +465,7 @@ static float dit_train_forward_backward(DiTTrain *   t,
     std::vector<uint16_t> ca_data((size_t) enc_S * S, ggml_fp32_to_fp16(0.0f));
     ggml_backend_tensor_set(t_ca_mask, ca_data.data(), 0, ca_data.size() * sizeof(uint16_t));
 
-    enum ggml_status st = static_graph_compute(&sg, t->dit.backend, t->dit.sched, gf);
+    enum ggml_status st = ggml_backend_graph_compute(t->dit.backend, gf);
     if (st != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "[Train] FATAL: graph compute failed (status=%d)\n", (int) st);
         exit(1);
@@ -429,7 +490,6 @@ static float dit_train_forward_backward(DiTTrain *   t,
     }
     t->accum_count++;
 
-    static_graph_release(&sg, t->dit.sched);
     ggml_free(ctx);
     return loss_val;
 }
@@ -463,8 +523,10 @@ static float dit_train_eval(DiTTrain *   t,
 
     struct ggml_tensor * t_input  = nullptr;
     struct ggml_tensor * t_output = nullptr;
+    g_dit_train_bf16_lora = true;
     struct ggml_cgraph *  gf =
         dit_ggml_build_graph(&t->dit, ctx, T, enc_S, /*N=*/1, &t_input, &t_output, t->lora.data(), /*want_grads=*/false);
+    g_dit_train_bf16_lora = false;
 
     struct ggml_tensor * flow_target = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, Oc, T, 1);
     ggml_set_name(flow_target, "flow_target");
@@ -485,8 +547,7 @@ static float dit_train_eval(DiTTrain *   t,
     struct ggml_tensor * t_sa_mask = ggml_graph_get_tensor(gf, "sa_mask_sw");
     struct ggml_tensor * t_ca_mask = ggml_graph_get_tensor(gf, "ca_mask");
 
-    StaticGraph sg;
-    if (!static_graph_alloc(&sg, t->dit.backend, t->dit.sched, gf)) {
+    if (!ggml_gallocr_alloc_graph(t->eval_galloc, gf)) {
         fprintf(stderr, "[Train] FATAL: failed to allocate eval graph\n");
         exit(1);
     }
@@ -529,7 +590,7 @@ static float dit_train_eval(DiTTrain *   t,
     std::vector<uint16_t> ca_data((size_t) enc_S * S, ggml_fp32_to_fp16(0.0f));
     ggml_backend_tensor_set(t_ca_mask, ca_data.data(), 0, ca_data.size() * sizeof(uint16_t));
 
-    enum ggml_status st = static_graph_compute(&sg, t->dit.backend, t->dit.sched, gf);
+    enum ggml_status st = ggml_backend_graph_compute(t->dit.backend, gf);
     if (st != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "[Train] FATAL: eval graph compute failed (status=%d)\n", (int) st);
         exit(1);
@@ -538,7 +599,6 @@ static float dit_train_eval(DiTTrain *   t,
     float loss_val = 0.0f;
     ggml_backend_tensor_get(loss, &loss_val, 0, sizeof(float));
 
-    static_graph_release(&sg, t->dit.sched);
     ggml_free(ctx);
     return loss_val;
 }
@@ -609,26 +669,52 @@ static void dit_train_optimizer_step(DiTTrain * t) {
         }
     }
 
-    StaticGraph sg;
-    if (!static_graph_alloc(&sg, t->dit.backend, t->dit.sched, gf)) {
+    if (!ggml_gallocr_alloc_graph(t->opt_galloc, gf)) {
         fprintf(stderr, "[Train] FATAL: failed to allocate optimizer-step graph\n");
         exit(1);
     }
 
+    // Average over the accumulated micro-batches first (as before), then
+    // clip the *global* gradient norm across every LoRA tensor jointly --
+    // matches torch.nn.utils.clip_grad_norm_, which Python's trainer calls
+    // with max_grad_norm=1.0 by default. Without this, a single step's
+    // gradient can be arbitrarily large (grows with T: more attention
+    // positions contribute to the summed MSE loss), and AdamW has no
+    // built-in defense against that -- an oversized raw gradient can push
+    // adam_v (the second moment) far out of scale for a few steps, causing
+    // the effective update to overshoot and destabilize training. Empirically
+    // reproduced: test-lora-train-smoke's single-fixed-target overfit
+    // converges to ~0 loss at T=128/384 but stalls/oscillates around
+    // loss=0.8-1.2 at T=1872 (real production scale) -- exactly the flat,
+    // never-decreasing loss curve seen on real multi-hundred-step training,
+    // and exactly the kind of instability grad clipping exists to prevent.
+    double grad_sumsq = 0.0;
     for (const GradUpload & u : uploads) {
         for (float & v : *u.host) {
             v *= inv_count;
+            grad_sumsq += (double) v * (double) v;
         }
+    }
+    double grad_norm = std::sqrt(grad_sumsq);
+    if (t->cfg.max_grad_norm > 0.0f && grad_norm > (double) t->cfg.max_grad_norm) {
+        float clip_scale = (float) ((double) t->cfg.max_grad_norm / (grad_norm + 1e-6));
+        for (const GradUpload & u : uploads) {
+            for (float & v : *u.host) {
+                v *= clip_scale;
+            }
+        }
+    }
+
+    for (const GradUpload & u : uploads) {
         ggml_backend_tensor_set(u.grad_in, u.host->data(), 0, u.host->size() * sizeof(float));
     }
 
-    enum ggml_status st = static_graph_compute(&sg, t->dit.backend, t->dit.sched, gf);
+    enum ggml_status st = ggml_backend_graph_compute(t->dit.backend, gf);
     if (st != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "[Train] FATAL: optimizer-step graph compute failed (status=%d)\n", (int) st);
         exit(1);
     }
 
-    static_graph_release(&sg, t->dit.sched);
     ggml_free(ctx);
 
     for (int i = 0; i < n_layers; i++) {
