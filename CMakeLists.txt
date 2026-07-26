@@ -50,6 +50,36 @@ if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
     endif()
 endif()
 
+# Local ggml patches (training-only additions -- see patches/README.md):
+# applied to the submodule's working tree at configure time, never committed
+# into the submodule's own git history. Idempotent (checked via `git apply
+# --reverse --check`) so repeated cmake reconfigures don't fail on a patch
+# that's already applied, and `git submodule update` / a fresh checkout
+# always needs this step to re-run once before the ggml sources it patches
+# are compiled.
+file(GLOB ACESTEP_GGML_PATCHES "${CMAKE_CURRENT_SOURCE_DIR}/patches/ggml-*.patch")
+foreach(_patch ${ACESTEP_GGML_PATCHES})
+    execute_process(
+        COMMAND git apply --reverse --check "${_patch}"
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/ggml"
+        RESULT_VARIABLE _ggml_patch_already_applied
+        OUTPUT_QUIET ERROR_QUIET
+    )
+    if(NOT _ggml_patch_already_applied EQUAL 0)
+        message(STATUS "Applying local ggml patch: ${_patch}")
+        execute_process(
+            COMMAND git apply "${_patch}"
+            WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/ggml"
+            RESULT_VARIABLE _ggml_patch_apply_result
+        )
+        if(NOT _ggml_patch_apply_result EQUAL 0)
+            message(FATAL_ERROR "Failed to apply local ggml patch: ${_patch}")
+        endif()
+    else()
+        message(STATUS "Local ggml patch already applied: ${_patch}")
+    endif()
+endforeach()
+
 # ggml as subdirectory, inherits GGML_CUDA, GGML_METAL, etc. from cmake flags
 # CUDA graphs default on: standalone ggml ships them off. Overridable with
 # -DGGML_CUDA_GRAPHS=OFF or at runtime with GGML_CUDA_DISABLE_GRAPHS=1.

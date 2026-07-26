@@ -28,6 +28,7 @@
 #include "dit.h"
 
 #include <cmath>
+#include <vector>
 
 // Helper: ensure tensor is f32 (cast if bf16/f16)
 static struct ggml_tensor * dit_ggml_f32(struct ggml_context * ctx, struct ggml_tensor * t) {
@@ -116,8 +117,20 @@ struct DiTLoraLayer {
 // PyTorch autocast's "cast operands to bf16, accumulate/output in f32"
 // behavior for the trainable LoRA A/B matmuls under Python's bf16-mixed
 // trainer. Forward-only rounding; backward is a straight-through estimator
-// (see ggml_bf16_rtne). Off by default -- src/dit-train.h sets it true only
-// around its own forward/backward and eval graph builds.
+// (see ggml_bf16_rtne, patches/ggml-bf16-rtne.patch). Off by default --
+// only set during training's forward/backward and eval graph builds, never
+// during inference, since the base (frozen) weights are already loaded in
+// their native GGUF dtype and inference merges finished LoRA weights at
+// full precision.
+//
+// ggml_bf16_rtne is a small addition to the ggml submodule (new
+// GGML_UNARY_OP_BF16_RTNE: native CUDA/CPU forward, straight-through
+// backward) applied as a patch file tracked in *this* repo
+// (patches/ggml-bf16-rtne.patch, see patches/README.md) at CMake configure
+// time -- never committed into the ggml submodule's own git history. Full
+// native speed, no CPU fallback, no scheduler, no extra graph nodes: this
+// is the same op used identically at both inference-graph and
+// training-graph call sites, just gated off by default.
 static bool g_dit_train_bf16_lora = false;
 
 static struct ggml_tensor * dit_ggml_bf16_rtne_maybe(struct ggml_context * ctx, struct ggml_tensor * t) {

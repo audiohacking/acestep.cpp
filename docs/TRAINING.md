@@ -185,6 +185,17 @@ architecture in `src/dit-graph.h` needs to be manually ported into
 stay in sync, only the file-level comment in `dit-train-graph.h` documenting
 the invariant.
 
+One piece of training does need a genuinely new GGML primitive (matching
+Python's bf16-autocast matmul precision on the LoRA branch — see
+`ggml_bf16_rtne` in `src/dit-train-graph.h`), and GGML's op dispatch has no
+plugin/extension point for adding one without editing `ggml.c`/
+`ggml-cuda.cu` directly. Rather than a submodule commit, this lives as
+`patches/ggml-bf16-rtne.patch` — applied to the submodule's *working tree*
+by CMake at configure time (idempotent, never touches the submodule's own
+git history). See `patches/README.md` for the mechanism and the two
+submodule-free alternatives that were tried and measured before landing
+on this approach.
+
 ## Troubleshooting
 
 - **Adapter has no audible effect**: check `adapter_scale` isn't 0; check

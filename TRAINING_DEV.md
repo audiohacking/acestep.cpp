@@ -1445,3 +1445,81 @@ not training-specific machinery, so left as-is pending explicit
 direction. `CMakeLists.txt`/`tests/CMakeLists.txt` additions (registering
 the `ace-train` and `test-grad-compare` targets) are unavoidable build-system
 wiring for a new binary, not behavioral changes to existing code.
+
+## Final resolution: `ggml_bf16_rtne` as a build-time patch, not a submodule commit
+
+Follow-up constraint, stricter than the one above: no commits into the
+`ggml` submodule's own git history at all -- not even isolated, documented
+ones. This ruled out the original `ggml_bf16_rtne` implementation as
+originally shipped (a real commit on the submodule's local `master`).
+
+Two submodule-free alternatives were built, measured, and rejected before
+landing on the final approach -- kept here for the record so they aren't
+reinvented:
+
+1. **`ggml_map_custom1` + `ggml_backend_sched`.** `ggml_map_custom1` is
+   GGML's own public escape hatch for arbitrary host callbacks, so the
+   rounding forward pass needs zero submodule changes. But it has no CUDA
+   kernel and no backward case anywhere in this fork, so it only works via
+   `ggml_backend_sched`'s automatic CPU fallback (confirmed already used
+   in `src/dit-sampler.h`, so not a foreign pattern) -- correct
+   (`test-lora-train-smoke` loss trajectory matched to 5-6 significant
+   digits), but every rounding op running off-GPU cost ~2x per training
+   step (measured: 1500 epochs went from ~10-13 min to projected 20-30+
+   min).
+2. **Two chained `ggml_cast` calls (F32->BF16->F32) + a transient `type`
+   spoof.** `ggml_cast` is a genuine, unmodified, native CUDA op already
+   used throughout this codebase for weight dtype conversion, so this is
+   fully native -- no CPU, no scheduler. The blocker:
+   `ggml_build_backward_expand` hard-asserts any gradient-needing source
+   is F32/F16 (`ggml.c`: `GGML_ASSERT(node->src[j]->type == GGML_TYPE_F32
+   || GGML_TYPE_F16)`), and the intermediate BF16 tensor trips it. Fix:
+   temporarily relabel that one intermediate tensor's `type` field to F32
+   for the sole duration of the `ggml_build_backward_expand()` call, then
+   restore it -- verified safe by reading `ggml_reshape`'s source (the one
+   thing CPY's backward formula calls on it): it only asserts on
+   `ggml_nelements`, and its own comment states "only the shape of b is
+   relevant, not its memory layout." This produced loss numbers matching
+   to 5-6 significant digits and needed zero CPU/scheduler, but full
+   per-matmul fidelity (rounding right before every individual q/k/v/o
+   LoRA matmul, matching PyTorch autocast's literal per-op behavior) needs
+   ~625 of these round-trips per training step -- ~1250 extra graph nodes
+   in a graph that's rebuilt from scratch every epoch, which inflates
+   `ggml_build_backward_expand`'s and the allocator's per-step,
+   node-count-scaling cost. A pointer-identity dedup cache (several call
+   sites round the exact same tensor -- self-attn's q/k/v share one
+   `norm_sa`, all 24 layers' cross-attn k/v share one graph-wide `enc`)
+   cut this from ~0.74s/epoch to ~0.57s/epoch (measured, 500-epoch runs),
+   still ~15-40% slower than the ~0.4-0.5s/epoch original baseline, purely
+   from graph size, not CPU/scheduler involvement this time.
+
+Both were rejected as compromises, not because they were broken. Given
+the explicit "we want the original method back, positioned in our code
+instead of patched into ggml" requirement, the actual final answer was
+simpler than either: **keep the original op exactly as built, store it as
+a patch file in this repo instead of a submodule commit.**
+
+`patches/ggml-bf16-rtne.patch` (see `patches/README.md`) contains the
+identical diff as the original working implementation --
+`GGML_UNARY_OP_BF16_RTNE`, native CUDA + CPU kernels, real backward case.
+`CMakeLists.txt` applies it to the `ggml` submodule's *working tree* at
+configure time, before `add_subdirectory(ggml)`, guarded by
+`git apply --reverse --check` for idempotency. The submodule's own commit
+history is never touched -- verified by reverting the submodule to
+pristine (`git checkout -- .` inside `ggml/`) and confirming `cmake`
+reapplies the patch cleanly from scratch, twice (first apply, then a
+no-op reconfigure that correctly detects "already applied").
+
+Verified after restoring this: `test-lora-train-smoke`'s loss trajectory
+is byte-for-byte identical to the original implementation's (every digit
+shown matches -- step 0: 2.824832, step 9: 1.085713, avg
+1.918640->1.232062). Timed 500-epoch run: 4m22.113s total ->
+~0.494s/epoch (subtracting ~15s model load), squarely inside the original
+~0.4-0.5s/epoch baseline. Zero compromises: native speed, correct
+backward, no submodule commit.
+
+`src/dit-train-graph.h`/`src/dit-train.h` are back to the simplest form
+(`ggml_bf16_rtne(ctx, t)` called directly, gated by
+`g_dit_train_bf16_lora`) -- no double-cast, no type-spoofing, no
+scheduler, no dedup cache; those all existed only during the
+rejected-alternative phase and are gone from the current code.

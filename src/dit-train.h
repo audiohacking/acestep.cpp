@@ -114,10 +114,11 @@ struct DiTTrain {
     // ggml_gallocr_needs_realloc in ggml-alloc.c); for same-shape samples
     // (the common case: a fixed T repeated every step, or a fixed-size
     // optimizer-step graph that never changes) alloc_graph becomes a cheap
-    // bookkeeping reset instead of a cudaMalloc/cudaFree pair. Recreating
-    // the allocator every step (the previous approach) defeated that reuse
-    // and forced a fresh cudaMalloc+cudaFree twice per step, which shows up
-    // as the GPU alternating between ~100% and ~0% utilization.
+    // bookkeeping reset instead of a cudaMalloc/cudaFree pair. All three
+    // graphs (forward+backward, eval, optimizer-step) run on t->dit.backend
+    // directly -- the bf16-precision rounding (src/dit-train-graph.h) is
+    // built entirely from genuine native ggml_cast ops, so there is no
+    // CPU-only node anywhere and no need for a multi-backend scheduler.
     ggml_gallocr_t fwd_galloc  = nullptr;  // dit_train_forward_backward's graph
     ggml_gallocr_t eval_galloc = nullptr;  // dit_train_eval's graph
     ggml_gallocr_t opt_galloc  = nullptr;  // dit_train_optimizer_step's graph
