@@ -203,13 +203,13 @@ int main(int argc, char ** argv) {
 
     // The LM is a generative captioner and is unreliable at precise numeric
     // musical attributes (measured: guessed bpm=71/key=C#minor on a track
-    // with true bpm=126/key=F minor). DSP analysis via Essentia
-    // (RhythmExtractor2013 + KeyExtractor) is authoritative for these two
-    // fields; the LM's caption/lyrics/timesignature/language are untouched.
-    // See TRAINING_DEV.md and src/audio-analysis.h.
+    // with true bpm=126/key=F minor). DSP analysis via acebeat is
+    // authoritative for these two fields; the LM's caption/lyrics/
+    // timesignature/language are untouched. See TRAINING_DEV.md and
+    // src/audio-analysis.h.
     AudioAnalysisResult ess;
     if (audio_analyze_bpm_key_from_file(src_audio_path, &ess)) {
-        fprintf(stderr, "[Understand-Essentia] bpm=%.1f (confidence=%.2f), key=%s %s (strength=%.2f)\n", ess.bpm,
+        fprintf(stderr, "[Understand-acebeat] bpm=%.1f (confidence=%.2f), key=%s %s (strength=%.2f)\n", ess.bpm,
                 ess.bpm_confidence, ess.key.c_str(), ess.scale.c_str(), ess.key_strength);
         out.bpm      = (int) std::lround(ess.bpm);
         out.keyscale = ess.key + " " + ess.scale;

@@ -805,52 +805,69 @@ train and generation time:
   treat as a draft, verify by ear or DSP (see Essentia below), never
   trust blindly.
 
-## Essentia integration: DSP-based bpm/key detection
+## acebeat integration: DSP-based bpm/key detection (MIT, replaces Essentia)
 
-Vendored [Essentia](https://essentia.upf.edu/) (MTG, AGPL-3.0) as a git
-submodule (`vendor/essentia`) for DSP-based tempo/key analysis
-(`RhythmExtractor2013`, `KeyExtractor`) to replace the LM's unreliable
-numeric-metadata guesses.
+DSP-based tempo/key analysis to complement the LM's unreliable numeric-
+metadata guesses, via `acebeat` (`vendor/acebeat/`) -- a from-scratch,
+MIT-licensed, dependency-free reimplementation. Previously used vendored
+[Essentia](https://essentia.upf.edu/) (MTG, AGPL-3.0); replaced to remove
+that AGPL liability from this MIT-licensed project. See
+`vendor/acebeat/README.md` for the clean-room statement (no Essentia
+source read, copied, or translated) and the algorithm references (Cooley-
+Tukey FFT, spectral-flux onset detection + autocorrelation for tempo,
+HPCP-style chroma + a multi-profile key-template ensemble for key).
 
-**Build**: `waf` (Essentia's own build), wired into CMake via
-`add_custom_command`/`add_custom_target` (`essentia_build`) ->
-`libessentia.a`, wrapped as an `IMPORTED` target linked **only** into
-`ace-train` and `ace-understand` directly -- **not** into `acestep-core`.
-`acestep-core` is the static library shared by every binary (`ace-synth`,
-`ace-lm`, `ace-server` too); this project is MIT-licensed, and Essentia is
-AGPL-3.0, so linking it into the shared library would carry AGPL's
-copyleft obligations onto binaries that never call into it. Verified with
-`nm -C` on the built binaries, not just by reading the CMake file: zero
-Essentia symbols in `ace-synth`/`ace-lm`/`ace-server`, present (as
-expected) in `ace-train`/`ace-understand`. Lightweight mode (`--lightweight=fftw,yaml
---build-static`): FFTW3 + libyaml only, no FFmpeg/libsamplerate/TagLib/
-Gaia2/TensorFlow (we do our own decode+resample and don't need file I/O
-or ML classifiers). Builds on ARM64 (NVIDIA GB10) with
-`libeigen3-dev`/`libfftw3-dev`/`libyaml-dev` from apt, ~52s for 294
-translation units.
+**Build**: plain CMake subdirectory (`add_subdirectory(vendor/acebeat)`),
+no external dependencies (no FFTW/libyaml/eigen3, no waf, no submodule).
+Linked directly into `ace-train`/`ace-understand` only, matching the
+isolation `essentia` used to have -- no licensing reason to keep it
+isolated now that it's MIT, but no reason to couple `acestep-core` to it
+either.
 
-**API**: `src/audio-analysis.h`.
-- `audio_analyze_bpm_key_buf()` -- low-level, pre-decoded buffer + rate.
+**API**: `src/audio-analysis.h` -- public surface unchanged from the
+Essentia era (`AudioAnalysisResult`, `audio_analyze_bpm_key_buf()`,
+`audio_analyze_bpm_key_from_file()`), so `tools/ace-understand.cpp` and
+`dit-prepare.h`'s call sites needed zero changes.
 - `audio_analyze_bpm_key_from_file()` -- use this one. Decodes at the
-  file's **native** rate, resamples once directly to 44100 Hz
-  (`RhythmExtractor2013` hardcodes an internal 44100 Hz assumption).
+  file's native rate, resamples once directly to 44100 Hz (matching the
+  exact pipeline shape the accuracy numbers below were measured with).
   Resampling from an already-48kHz-resampled buffer (native->48k->44.1k,
-  two lowpass passes) measurably degrades tempo tracking: 126.0 exact
-  vs. 144.6 on the same confirmed-bpm=126 track. Always feed it the
-  original file path, not a buffer the rest of the pipeline already
-  resampled.
+  two lowpass passes) measurably degraded tempo tracking under the old
+  Essentia backend (126.0 exact vs. 144.6 on a confirmed-bpm=126 track);
+  untested for acebeat specifically, but there's no reason to reintroduce
+  the extra hop. Always feed it the original file path.
+- Fixed a real bug while rewriting `audio_analyze_bpm_key_buf()`'s
+  internals: `audio_read()`/`audio_resample()` return **planar** stereo
+  ([L: T][R: T]), but the old downmix (`0.5f*(src[i*2]+src[i*2+1])`)
+  assumed interleaved layout -- reading half-scrambled channel data for
+  roughly the back half of every buffer. The "confirmed ground truth"
+  match noted below still held despite this, since periodicity/pitch-
+  class content survives some channel scrambling; fixed now regardless.
 
 **Call sites** (fill gaps only, never override an explicit value):
 - `tools/ace-understand.cpp`: overrides `out.bpm`/`out.keyscale` after
   `ace_understand_generate()` returns.
 - `dit-prepare.h`'s `dit_prepare_encode_sample()` (step 2b): runs
   whenever `label.bpm <= 0 || label.keyscale.empty()`, decoupled from
-  the caption-empty auto-label gate above it (Essentia doesn't need a
+  the caption-empty auto-label gate above it (acebeat doesn't need a
   caption to run).
 
-**Verified**: matches confirmed ground truth (bpm=126, key=F minor)
-exactly on a real track. `test-lora-roundtrip`/`test-lora-train-smoke`/
-`test-model-store` still PASS.
+**Verified**: real-corpus accuracy gate against Essentia's own output
+(~1900 tracks from a real training-data corpus): bpm 84.7% exact-or-
+octave-tolerant, key 58.2% exact / ~71% combined (exact + relative
+major/minor + right-root-wrong-mode). Achieved via 8 independent DSP
+refinements (peak-picking, frequency-resolution fix, sub-harmonic
+summation, tuning calibration, a multi-profile template ensemble, soft
+pitch-class binning, threshold/compression tuning, parabolic peak
+interpolation) plus a bass-register chroma boost that targets a
+diagnostically-confirmed tonic/dominant confusion pattern -- all
+individually validated, several other attempted refinements (a
+higher-resolution HPCP variant, spectral whitening, segment-based
+voting, a discrete correlation-tolerance correction) measured neutral or
+negative and were not kept. `nm -C` confirms zero Essentia symbols
+anywhere in the built tree (there is no Essentia anywhere anymore --
+`vendor/essentia` was removed). `test-lora-roundtrip`/
+`test-lora-train-smoke`/`test-model-store` still PASS.
 
 ## Training timestep distribution: continuous, not discrete
 

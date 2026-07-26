@@ -329,7 +329,7 @@ static bool dit_prepare_encode_sample(ModelStore *              store,
         return false;
     }
 
-    // ---- 2b. Fill bpm/keyscale gaps via DSP analysis (Essentia) -----------
+    // ---- 2b. Fill bpm/keyscale gaps via DSP analysis (acebeat) -------------
     // Deliberately independent of the caption gate above: a sidecar can
     // supply its own caption (so the LM-based auto-label never runs) while
     // still leaving bpm/keyscale at 0/"" -- exactly the bug that caused a
@@ -337,13 +337,13 @@ static bool dit_prepare_encode_sample(ModelStore *              store,
     // training conditioned on "bpm: N/A" while generation's LM guessed a
     // real number. The LM's own bpm/key guess is also unreliable (measured:
     // 71/C#minor vs. true 126/F minor on a real track), so DSP analysis via
-    // Essentia (RhythmExtractor2013 + KeyExtractor) is authoritative here,
-    // not just a fallback -- but it still only fills gaps, never overrides
-    // a value the sidecar (i.e. the user) explicitly set.
+    // acebeat is authoritative here, not just a fallback -- but it still
+    // only fills gaps, never overrides a value the sidecar (i.e. the user)
+    // explicitly set.
     if (label.bpm <= 0 || label.keyscale.empty()) {
         AudioAnalysisResult ess;
         if (audio_analyze_bpm_key_from_file(label.audio_path.c_str(), &ess)) {
-            fprintf(stderr, "[Prepare] Essentia %s: bpm=%.1f (confidence=%.2f), key=%s %s (strength=%.2f)\n",
+            fprintf(stderr, "[Prepare] acebeat %s: bpm=%.1f (confidence=%.2f), key=%s %s (strength=%.2f)\n",
                     label.stem.c_str(), ess.bpm, ess.bpm_confidence, ess.key.c_str(), ess.scale.c_str(),
                     ess.key_strength);
             if (label.bpm <= 0) {

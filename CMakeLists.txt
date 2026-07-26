@@ -91,6 +91,12 @@ add_subdirectory(ggml)
 # cpp-httplib (HTTP server library, used by ace-server)
 add_subdirectory(vendor/cpp-httplib)
 
+# acebeat (MIT, first-party): BPM/key detection (src/audio-analysis.h),
+# replacing the formerly-vendored AGPL-3.0 Essentia dependency. Linked
+# directly into ace-train/ace-understand only (not acestep-core) -- see
+# those targets below.
+add_subdirectory(vendor/acebeat)
+
 # Shared compile options and ggml linkage
 macro(link_ggml_backends target)
     target_include_directories(${target} PRIVATE
@@ -139,57 +145,6 @@ else()
     target_compile_options(yyjson PRIVATE -w)
 endif()
 
-# Essentia (AGPL-3.0, vendored submodule) -- DSP-based BPM/key detection
-# (RhythmExtractor2013, KeyExtractor) to complement the LM's own (unreliable)
-# numeric-metadata guesses in ace-understand / ace-train prepare's auto-label.
-# Built via its own waf build system in "lightweight" mode: only FFTW + libyaml
-# as optional deps (no FFmpeg/libsamplerate/TagLib/Gaia/TensorFlow -- we do our
-# own audio decode+resample and don't need file-metadata or ML classifiers).
-#
-# IMPORTANT: link this ONLY into the specific executables that use
-# src/audio-analysis.h (currently ace-understand and ace-train), never into
-# acestep-core. acestep-core is linked into every binary (ace-synth, ace-lm,
-# ace-server too), and this project is MIT-licensed -- statically linking an
-# AGPL-3.0 dependency into that shared library would carry AGPL's copyleft
-# obligations onto binaries that never use it and have no need to.
-find_package(PkgConfig REQUIRED)
-pkg_check_modules(FFTW3F REQUIRED fftw3f)
-pkg_check_modules(ESSENTIA_YAML REQUIRED yaml-0.1)
-pkg_check_modules(ESSENTIA_EIGEN3 REQUIRED eigen3)
-
-include(ProcessorCount)
-ProcessorCount(ESSENTIA_NPROC)
-if(ESSENTIA_NPROC EQUAL 0)
-    set(ESSENTIA_NPROC 4)
-endif()
-
-set(ESSENTIA_DIR ${CMAKE_CURRENT_SOURCE_DIR}/vendor/essentia)
-set(ESSENTIA_LIB ${ESSENTIA_DIR}/build/src/libessentia.a)
-find_program(PYTHON3_EXECUTABLE python3 REQUIRED)
-add_custom_command(
-    OUTPUT ${ESSENTIA_LIB}
-    COMMAND ${PYTHON3_EXECUTABLE} waf configure --lightweight=fftw,yaml --build-static --mode=release
-    COMMAND ${PYTHON3_EXECUTABLE} waf build -j${ESSENTIA_NPROC}
-    WORKING_DIRECTORY ${ESSENTIA_DIR}
-    COMMENT "Building vendored Essentia (lightweight: fftw+yaml only)"
-    VERBATIM
-)
-add_custom_target(essentia_build DEPENDS ${ESSENTIA_LIB})
-
-add_library(essentia STATIC IMPORTED GLOBAL)
-set_target_properties(essentia PROPERTIES IMPORTED_LOCATION ${ESSENTIA_LIB})
-add_dependencies(essentia essentia_build)
-target_include_directories(essentia INTERFACE
-    ${ESSENTIA_DIR}/src
-    ${ESSENTIA_DIR}/src/essentia
-    ${ESSENTIA_DIR}/src/essentia/scheduler
-    ${ESSENTIA_DIR}/src/essentia/streaming
-    ${ESSENTIA_DIR}/src/essentia/streaming/algorithms
-    ${ESSENTIA_DIR}/src/essentia/utils
-    ${ESSENTIA_EIGEN3_INCLUDE_DIRS}
-)
-target_link_libraries(essentia INTERFACE ${FFTW3F_LIBRARIES} ${ESSENTIA_YAML_LIBRARIES} Threads::Threads)
-
 # Core library (shared between binaries)
 add_library(acestep-core STATIC
     src/request.cpp
@@ -213,9 +168,12 @@ target_link_libraries(ace-lm PRIVATE acestep-core)
 link_ggml_backends(ace-lm)
 
 # ace-train: native LoRA training (fit) + dataset preparation (prepare, Phase 4)
-# Links essentia directly (not via acestep-core) -- see the AGPL note above.
+# Links acebeat directly (not via acestep-core), matching the isolation
+# pattern from when this was the AGPL-3.0 Essentia dependency -- no
+# licensing reason to keep it isolated now that acebeat is MIT, but no
+# reason for acestep-core to depend on it either.
 add_executable(ace-train tools/ace-train.cpp)
-target_link_libraries(ace-train PRIVATE acestep-core essentia)
+target_link_libraries(ace-train PRIVATE acestep-core acebeat)
 link_ggml_backends(ace-train)
 
 # webui: convert tools/webui/public/index.html.gz to a C header for embedding.
@@ -237,9 +195,9 @@ target_include_directories(ace-server PRIVATE ${CMAKE_CURRENT_BINARY_DIR})
 target_link_libraries(ace-server PRIVATE acestep-core httplib)
 link_ggml_backends(ace-server)
 
-# Links essentia directly (not via acestep-core) -- see the AGPL note above.
+# Links acebeat directly (not via acestep-core) -- see the ace-train note above.
 add_executable(ace-understand tools/ace-understand.cpp)
-target_link_libraries(ace-understand PRIVATE acestep-core essentia)
+target_link_libraries(ace-understand PRIVATE acestep-core acebeat)
 link_ggml_backends(ace-understand)
 
 # quantize: GGUF requantizer (BF16 -> K-quants)
